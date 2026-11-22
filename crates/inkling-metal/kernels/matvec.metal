@@ -317,3 +317,18 @@ kernel void mv_q8_0_multi(device const uchar *W [[buffer(0)]], device const floa
     device float *outs[MULTI_MAX] = {o0, o1, o2, o3, o4, o5, o6, o7};
     outs[s][lr] = v;
 }
+
+// y[t][r] = W[r] . x[t] with a whole threadgroup per row (split over its simdgroups), for short
+// fat f32 matrices like the 128-row router that would otherwise launch only a few threadgroups.
+// Grid: (rows, n_tokens), 256 threads.
+kernel void mv_f32_rowtg(device const float *W [[buffer(0)]], device const float *x [[buffer(1)]], device float *y [[buffer(2)]],
+                         constant MvArgs &a [[buffer(3)]], uint2 tg [[threadgroup_position_in_grid]],
+                         uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float scratch[32];
+    device const float4 *w = (device const float4 *)(W + (ulong)tg.x * a.cols);
+    device const float4 *xv = (device const float4 *)(x + (ulong)tg.y * a.cols);
+    float acc = 0.0f;
+    for (uint i = tid; i < a.cols / 4; i += 256) acc += dot(w[i], xv[i]);
+    float s = tg_sum(acc, scratch, tid, 256);
+    if (tid == 0) y[(ulong)tg.y * a.rows + tg.x] = s;
+}

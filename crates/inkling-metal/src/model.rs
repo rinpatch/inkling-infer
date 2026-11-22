@@ -66,10 +66,23 @@ struct ConvArgs {
     second: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ConvHeadArgs {
+    kv_dim: u32,
+    head_dim: u32,
+    nc: u32,
+    dyn_: u32,
+    scale: f32,
+    n_tokens: u32,
+    mode: u32,
+    threshold: f32,
+    eps: f32,
+}
+
 /// Optional second output of a conv dispatch.
 #[derive(Clone, Copy)]
 enum Second<'b> {
-    None,
     /// `y2 = y`
     Copy(&'b Buffer),
     /// `y2 = res + y`
@@ -908,7 +921,6 @@ impl MetalModel {
         let dyn_heads = if dyn_.is_some() { self.hp.n_head_kv } else { 0 };
         let scale = 1.0 / (((if dyn_.is_some() { 2 } else { 1 }) * nc + 1) as f32).sqrt();
         let (mode, res, y2) = match second {
-            Second::None => (0, x, x),
             Second::Copy(o) => (1, x, o),
             Second::AddRes(r, o) => (2, r, o),
         };
@@ -1331,46 +1343,53 @@ impl MetalModel {
             nt,
         )?;
 
-        // K and V convolve straight into the cache rows pos..pos+nt; clip / norm run there in place
+        // K and V convolve straight into the cache rows pos..pos+nt, with the per-head key clip /
+        // value RMS norm fused in (one threadgroup per KV head)
         let kv_off = self.pos * kvd;
-        self.conv(
-            e,
-            &a.k_lin,
-            &slot.conv[0],
-            lw.k_conv,
-            lw.k_conv_proj.map(|_| &a.k_dyn),
-            &slot.k,
-            kv_off,
-            Second::None,
-            kvd,
-            nt,
-        )?;
-        self.clip(e, &slot.k, kv_off, None, hd, nkv, hp.qk_clip, false, nt)?;
-        self.conv(
-            e,
-            &a.v_lin,
-            &slot.conv[1],
-            lw.v_conv,
-            lw.v_conv_proj.map(|_| &a.v_dyn),
-            &slot.v,
-            kv_off,
-            Second::None,
-            kvd,
-            nt,
-        )?;
-        e.dispatch(
-            "rms_heads",
-            &[
-                buf_at(&slot.v, kv_off * 4),
-                bytes(&NormArgs {
-                    n: hd as u32,
-                    eps: hp.rms_eps,
-                    has_weight: 0,
-                }),
-            ],
-            (nkv * nt, 1, 1),
-            (32, 1, 1),
-        )?;
+        let nc = hp.n_conv;
+        for (lin, hist, taps, dynw, cache, mode) in [
+            (
+                &a.k_lin,
+                &slot.conv[0],
+                lw.k_conv,
+                lw.k_conv_proj.map(|_| &a.k_dyn),
+                &slot.k,
+                0u32,
+            ),
+            (
+                &a.v_lin,
+                &slot.conv[1],
+                lw.v_conv,
+                lw.v_conv_proj.map(|_| &a.v_dyn),
+                &slot.v,
+                1u32,
+            ),
+        ] {
+            let dyn_ = dynw.is_some();
+            e.dispatch(
+                "conv_head",
+                &[
+                    buf(lin),
+                    buf(hist),
+                    buf_at(&self.w, taps.0),
+                    buf(dynw.unwrap_or(lin)),
+                    buf_at(cache, kv_off * 4),
+                    bytes(&ConvHeadArgs {
+                        kv_dim: kvd as u32,
+                        head_dim: hd as u32,
+                        nc: nc as u32,
+                        dyn_: dyn_ as u32,
+                        scale: 1.0 / (((if dyn_ { 2 } else { 1 }) * nc + 1) as f32).sqrt(),
+                        n_tokens: nt as u32,
+                        mode,
+                        threshold: hp.qk_clip,
+                        eps: hp.rms_eps,
+                    }),
+                ],
+                (nkv, 1, 1),
+                (hd, 1, 1),
+            )?;
+        }
         self.clip(
             e,
             &a.r,
@@ -1564,15 +1583,19 @@ impl MetalModel {
             self.msg_gate(e, g, &a.m, 0, &a.msgs, 3 * plane, &a.m, 0, nt)?;
         }
         self.norm(e, &a.m, 0, Some(lw.ffn_norm), &a.n, 0, d, hp.rms_eps, nt)?;
-        self.mv(
-            e,
-            "mv_f32",
-            lw.router,
-            &a.n,
-            &a.router_logits,
-            hp.n_expert,
-            d,
-            nt,
+        e.dispatch(
+            "mv_f32_rowtg",
+            &[
+                buf_at(&self.w, lw.router.0),
+                buf(&a.n),
+                buf(&a.router_logits),
+                bytes(&MvArgs {
+                    rows: hp.n_expert as u32,
+                    cols: d as u32,
+                }),
+            ],
+            (hp.n_expert, nt, 1),
+            (256, 1, 1),
         )?;
         rec(e, "ffn_moe_logits", s, &a.router_logits, 0, hp.n_expert)?;
         let Some(bias) = lw.exp_probs_b else {

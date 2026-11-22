@@ -486,3 +486,48 @@ kernel void gate_mul(device const float *o [[buffer(0)]], device float *g [[buff
                      uint i [[thread_position_in_grid]]) {
     if (i < a.n) g[i] = o[i] * sigmoidf(g[i]);
 }
+
+// ---- K / V short conv fused with the per-head normalization ------------------------------------
+// One threadgroup per KV head (head_dim threads, one per channel): the conv is per channel, and
+// the head's L2 clip (keys) or unweighted RMS norm (values) is a reduction over the threadgroup.
+// Writes [n_tokens][kv_dim] at y (the cache rows).
+
+struct ConvHeadArgs {
+    uint kv_dim;
+    uint head_dim;
+    uint nc;
+    uint dyn;         // dynamic taps present (full-attention layers)
+    float scale;
+    uint n_tokens;
+    uint mode;        // 0: L2 clip to `threshold` (keys), 1: RMS norm with `eps` (values)
+    float threshold;
+    float eps;
+};
+
+kernel void conv_head(device const float *x [[buffer(0)]], device float *hist [[buffer(1)]], device const float *taps [[buffer(2)]],
+                      device const float *dynw [[buffer(3)]], device float *y [[buffer(4)]], constant ConvHeadArgs &a [[buffer(5)]],
+                      uint h [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]]) {
+    threadgroup float scratch[32];
+    uint c = h * a.head_dim + tid;
+    uint nh = a.nc - 1;
+    float xs[8];
+    for (uint l = 1; l < a.nc; ++l) xs[l] = hist[(nh - l) * a.kv_dim + c];
+    float w[8];
+    for (uint l = 0; l < a.nc; ++l) w[l] = taps[c * a.nc + (a.nc - 1 - l)];
+    uint n_heads = a.kv_dim / a.head_dim;
+    for (uint t = 0; t < a.n_tokens; ++t) {
+        xs[0] = x[(ulong)t * a.kv_dim + c];
+        float acc = 0.0f;
+        for (uint l = 0; l < a.nc; ++l) acc += w[l] * xs[l];
+        if (a.dyn) {
+            device const float *dt = dynw + ((ulong)t * n_heads + h) * a.nc;
+            for (uint l = 0; l < a.nc; ++l) acc += dt[l] * xs[l];
+        }
+        float out = (xs[0] + acc) * a.scale;
+        float ss = tg_sum(out * out, scratch, tid, a.head_dim);
+        float f = a.mode == 0 ? min(1.0f, a.threshold / (sqrt(ss) + 1e-6f)) : rsqrt(ss / a.head_dim + a.eps);
+        y[(ulong)t * a.kv_dim + c] = out * f;
+        for (uint l = a.nc - 1; l > 0; --l) xs[l] = xs[l - 1];
+    }
+    for (uint l = 1; l < a.nc; ++l) hist[(nh - l) * a.kv_dim + c] = xs[l];
+}

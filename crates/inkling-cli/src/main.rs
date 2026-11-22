@@ -270,11 +270,19 @@ fn bench(args: &Args, g: &gguf::Gguf, hp: &Hparams) -> Result<()> {
             if args.depth > 0 {
                 eng.prefill(&tokens[..args.depth])?;
             }
-            let mut next = tokens[0];
             let t = Instant::now();
-            for _ in 0..args.tg {
-                let logits = eng.step(next)?;
-                next = sample(&logits, 0.0, &mut Rng(1));
+            match &mut eng {
+                // greedy decode with the pick on the GPU and steps queued back to back
+                Engine::Metal(m) => {
+                    m.decode_greedy(tokens[0], args.tg)?;
+                }
+                Engine::Cpu(_) => {
+                    let mut next = tokens[0];
+                    for _ in 0..args.tg {
+                        let logits = eng.step(next)?;
+                        next = sample(&logits, 0.0, &mut Rng(1));
+                    }
+                }
             }
             if rep > 0 {
                 tg.push(args.tg as f64 / t.elapsed().as_secs_f64());

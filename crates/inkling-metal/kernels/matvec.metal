@@ -112,9 +112,10 @@ inline float half_dot(device const block_iq4_nl *b, thread const XHalf &x, uint 
 
 #define MOE_NR 2  // ff rows (gate+up pairs) per simdgroup in gate_up; d rows per simdgroup in down
 
-// act[k][i] = softcap(g)*sigmoid(g)*softcap(u), [g; u] = GateUp_{ids[k]} x, rows i and n_ff+i.
-// A simdgroup computes MOE_NR consecutive i (2*MOE_NR rows), reusing each loaded x slice for all
-// of them. Grid: (ceil(n_ff / (MV_SG*MOE_NR)), n_used).
+// act[p][i] = softcap(g)*sigmoid(g)*softcap(u), [g; u] = GateUp_{ids[p]} x[p / n_used], rows i and
+// n_ff+i, for every (token, expert) pair p. A simdgroup computes MOE_NR consecutive i (2*MOE_NR
+// rows), reusing each loaded x slice for all of them. Grid: (ceil(n_ff / (MV_SG*MOE_NR)),
+// n_tokens * n_used); decode is n_tokens = 1, short batches (speculative verify) a few more.
 template <typename B>
 kernel void moe_gate_up(device const B *W [[buffer(0)]], device const float *x [[buffer(1)]], device const uint *ids [[buffer(2)]],
                         device float *act [[buffer(3)]], constant MoeArgs &a [[buffer(4)]], uint2 tg [[threadgroup_position_in_grid]],
@@ -127,6 +128,7 @@ kernel void moe_gate_up(device const B *W [[buffer(0)]], device const float *x [
     if (i0 >= a.n_ff) return;
     uint nb = a.n_embd / QK;
     device const B *E = W + (ulong)ids[k] * 2 * a.n_ff * nb;
+    x += (k / a.n_used) * a.n_embd;
     float g[MOE_NR] = {0}, u[MOE_NR] = {0};
     for (uint t = lane; t < 2 * nb; t += 32) {
         uint b = t / 2, h = t % 2;
@@ -138,19 +140,25 @@ kernel void moe_gate_up(device const B *W [[buffer(0)]], device const float *x [
     }
     for (uint r = 0; r < MOE_NR; ++r) {
         float gs = simd_sum(g[r]), us = simd_sum(u[r]);
-        if (lane == 0 && i0 + r < a.n_ff) act[k * a.n_ff + i0 + r] = softcapf(gs, a.situ_beta) * sigmoidf(gs) * softcapf(us, a.situ_lin);
+        if (lane == 0 && i0 + r < a.n_ff) act[(ulong)k * a.n_ff + i0 + r] = softcapf(gs, a.situ_beta) * sigmoidf(gs) * softcapf(us, a.situ_lin);
     }
 }
 
-// y[r] = sum_k w[k] * Down_{ids[k]}[r] . act[k]. A simdgroup computes MOE_NR rows, walking all k
-// experts' half-blocks as one range (nb is only 36 for n_ff = 1152). Grid: ceil(n_embd / (MV_SG*MOE_NR)).
+// y[t][r] = sum_k w[t][k] * Down_{ids[t][k]}[r] . act[t][k]. A simdgroup computes MOE_NR rows,
+// walking all k experts' half-blocks as one range (nb is only 36 for n_ff = 1152).
+// Grid: (ceil(n_embd / (MV_SG*MOE_NR)), n_tokens).
 template <typename B>
 kernel void moe_down(device const B *W [[buffer(0)]], device const float *act [[buffer(1)]], device const uint *ids [[buffer(2)]],
                      device const float *wts [[buffer(3)]], device float *y [[buffer(4)]], constant MoeArgs &a [[buffer(5)]],
-                     uint tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                     uint2 tg2 [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
                      uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
     threadgroup float tab[16];
     load_table(tab, tid);
+    uint tg = tg2.x, tok = tg2.y;
+    ids += tok * a.n_used;
+    wts += tok * a.n_used;
+    act += (ulong)tok * a.n_used * a.n_ff;
+    y += (ulong)tok * a.n_embd;
     uint r0 = (tg * MV_SG + sg) * MOE_NR;
     if (r0 >= a.n_embd) return;
     uint nb = a.n_ff / QK;
@@ -173,7 +181,7 @@ kernel void moe_down(device const B *W [[buffer(0)]], device const float *act [[
                                                                            device const uint *, device float *, constant MoeArgs &, \
                                                                            uint2, uint, uint, uint);                                 \
     template [[host_name("moe_down_" name)]] kernel void moe_down<T>(device const T *, device const float *, device const uint *,   \
-                                                                     device const float *, device float *, constant MoeArgs &, uint, \
+                                                                     device const float *, device float *, constant MoeArgs &, uint2, \
                                                                      uint, uint, uint);
 MOE_INSTANCES(block_iq4_nl, "iq4_nl")
 MOE_INSTANCES(block_q8_0, "q8_0")

@@ -11,8 +11,8 @@ use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_foundation::{NSRange, NSString, NSURL};
 use objc2_metal::{
-    MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue,
-    MTLComputeCommandEncoder, MTLComputePassDescriptor, MTLComputePipelineState,
+    MTLBarrierScope, MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder,
+    MTLCommandQueue, MTLComputeCommandEncoder, MTLComputePassDescriptor, MTLComputePipelineState,
     MTLCounterSampleBuffer, MTLCounterSampleBufferDescriptor, MTLCounterSet,
     MTLCreateSystemDefaultDevice, MTLDevice, MTLDispatchType, MTLLibrary, MTLResourceOptions,
     MTLSize, MTLStorageMode,
@@ -153,14 +153,22 @@ impl Context {
         Ok(Buffer { raw, len })
     }
 
-    /// Encodes `f` into one serial compute encoder in one command buffer, commits it, and waits.
+    /// Encodes `f` into one compute encoder in one command buffer, commits it, and waits. The
+    /// encoder is concurrent, but every dispatch is followed by a buffer barrier unless it sits
+    /// inside `Encoder::parallel`, so ordering is serial by default.
     pub fn run(&self, f: impl FnOnce(&mut Encoder) -> Result<()>) -> Result<RunStats> {
+        self.submit(f)?.wait()
+    }
+
+    /// Like `run`, but returns once the command buffer is committed. Command buffers on the queue
+    /// execute in submission order, so later submissions see this one's writes.
+    pub fn submit(&self, f: impl FnOnce(&mut Encoder) -> Result<()>) -> Result<Pending> {
         let cb = self
             .queue
             .commandBuffer()
             .ok_or_else(|| Error::Metal("commandBuffer".into()))?;
         let enc = cb
-            .computeCommandEncoderWithDispatchType(MTLDispatchType::Serial)
+            .computeCommandEncoderWithDispatchType(MTLDispatchType::Concurrent)
             .ok_or_else(|| Error::Metal("computeCommandEncoder".into()))?;
         let mut e = Encoder {
             ctx: self,
@@ -168,6 +176,7 @@ impl Context {
             enc: Some(enc),
             profile: None,
             n_dispatch: 0,
+            in_parallel: false,
         };
         let t_enc = std::time::Instant::now();
         let res = f(&mut e);
@@ -178,17 +187,34 @@ impl Context {
         let n_dispatch = e.n_dispatch;
         res?;
         cb.commit();
-        cb.waitUntilCompleted();
-        if cb.status() == MTLCommandBufferStatus::Error {
+        Ok(Pending {
+            cb,
+            encode_s,
+            n_dispatch,
+        })
+    }
+}
+
+/// A committed command buffer.
+pub struct Pending {
+    cb: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+    encode_s: f64,
+    n_dispatch: usize,
+}
+
+impl Pending {
+    pub fn wait(self) -> Result<RunStats> {
+        self.cb.waitUntilCompleted();
+        if self.cb.status() == MTLCommandBufferStatus::Error {
             return Err(Error::Metal(format!(
                 "command buffer failed: {:?}",
-                cb.error()
+                self.cb.error()
             )));
         }
         Ok(RunStats {
-            gpu_s: cb.GPUEndTime() - cb.GPUStartTime(),
-            encode_s,
-            n_dispatch,
+            gpu_s: self.cb.GPUEndTime() - self.cb.GPUStartTime(),
+            encode_s: self.encode_s,
+            n_dispatch: self.n_dispatch,
         })
     }
 }
@@ -242,6 +268,7 @@ impl Context {
                 names: Vec::new(),
             }),
             n_dispatch: 0,
+            in_parallel: false,
         };
         f(&mut e)?;
         cb.commit();
@@ -340,6 +367,7 @@ pub struct Encoder<'c> {
     enc: Option<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>>,
     profile: Option<Profiler>,
     pub n_dispatch: usize,
+    in_parallel: bool,
 }
 
 /// Timestamp sample buffers hold at most 4096 samples (32 KB), so long profiles chain several.
@@ -415,8 +443,23 @@ impl Encoder<'_> {
         enc.dispatchThreadgroups_threadsPerThreadgroup(g, t);
         if self.enc.is_none() {
             enc.endEncoding();
+        } else if !self.in_parallel {
+            enc.memoryBarrierWithScope(MTLBarrierScope::Buffers);
         }
         self.n_dispatch += 1;
         Ok(())
+    }
+
+    /// Encodes `f` with no barriers between its dispatches, then one barrier after them. Only for
+    /// dispatches that neither read nor write anything another one in the group writes.
+    pub fn parallel(&mut self, f: impl FnOnce(&mut Self) -> Result<()>) -> Result<()> {
+        assert!(!self.in_parallel, "nested parallel groups");
+        self.in_parallel = true;
+        let r = f(self);
+        self.in_parallel = false;
+        if let Some(enc) = &self.enc {
+            enc.memoryBarrierWithScope(MTLBarrierScope::Buffers);
+        }
+        r
     }
 }

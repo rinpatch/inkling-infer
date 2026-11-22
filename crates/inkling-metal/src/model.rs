@@ -64,6 +64,7 @@ struct ConvArgs {
     scale: f32,
     n_tokens: u32,
     second: u32,
+    snap: u32,
 }
 
 #[repr(C)]
@@ -78,6 +79,7 @@ struct ConvHeadArgs {
     mode: u32,
     threshold: f32,
     eps: f32,
+    snap: u32,
 }
 
 /// Optional second output of a conv dispatch.
@@ -160,6 +162,12 @@ struct MultiArgs {
 }
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct ArgmaxArgs {
+    n: u32,
+    out_index: u32,
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct GateArgs {
     d: u32,
     rank: u32,
@@ -218,6 +226,8 @@ const GEMM_BM2: usize = 64;
 pub const MAX_BATCH: usize = 512;
 /// Rows per simdgroup in the MoE kernels (kernels/matvec.metal MOE_NR).
 const MOE_NR: usize = 2;
+/// Largest speculative verify batch (anchor + 7 drafts).
+pub const MAX_VERIFY: usize = 8;
 const MAX_BLOCKS: usize = 8;
 
 /// Trace hook used while encoding: (encoder, name, slot, source buffer, float offset, float count).
@@ -351,6 +361,13 @@ pub struct MetalModel {
     pub exact_prefill: bool,
     /// Stats of the most recent step.
     pub last: RunStats,
+    /// DSpark drafter features, [4][max_batch][d]: the inputs of slots `drafter::FEATURE_SLOTS`
+    /// and the final normed hidden. Off unless `enable_capture` was called.
+    capture: Option<Buffer>,
+    /// Per-token conv histories of a speculative verify batch (`verify` / `rewind`), laid out by
+    /// `snap_off`. Allocated on first use; `verify_rows` > 0 only while a verify is encoded.
+    conv_snap: Option<Buffer>,
+    verify_rows: usize,
 }
 
 fn tensor(g: &Gguf, name: &str, want: DType) -> Result<T> {
@@ -579,6 +596,9 @@ impl MetalModel {
             max_ctx,
             max_batch: MAX_BATCH,
             exact_prefill: std::env::var_os("INKLING_EXACT_PREFILL").is_some(),
+            capture: None,
+            conv_snap: None,
+            verify_rows: 0,
             kv_f16: opts.kv_f16,
             pos: 0,
             trace_buf,
@@ -693,6 +713,159 @@ impl MetalModel {
     }
 
     /// Runs a prompt in batches of up to MAX_BATCH tokens and returns the last token's logits.
+    /// Greedy generation of `n` tokens after `first`, entirely on the GPU: each step ends with an
+    /// argmax that writes the next input token, so steps are queued back to back (two command
+    /// buffers in flight) while the CPU encodes ahead. Returns the generated tokens.
+    pub fn decode_greedy(&mut self, first: u32, n: usize) -> Result<Vec<u32>> {
+        if self.pos + n > self.max_ctx {
+            return Err(Error::Model(inkling::Error::ContextFull(self.pos + n)));
+        }
+        let out = self.ctx.buffer(n.max(1) * 4)?;
+        self.a.tokens.write(&[first]);
+        let mut noop = |_: &mut Encoder,
+                        _: &'static str,
+                        _: Option<usize>,
+                        _: &Buffer,
+                        _: usize,
+                        _: usize|
+         -> Result<()> { Ok(()) };
+        let mut in_flight = std::collections::VecDeque::new();
+        for i in 0..n {
+            let this = &*self;
+            let p = this.ctx.submit(|e| {
+                this.encode(e, 1, None, &mut noop)?;
+                e.dispatch(
+                    "argmax_token",
+                    &[
+                        buf(&this.a.logits),
+                        buf(&this.a.tokens),
+                        buf(&out),
+                        bytes(&ArgmaxArgs {
+                            n: this.hp.n_vocab as u32,
+                            out_index: i as u32,
+                        }),
+                    ],
+                    (1, 1, 1),
+                    (1024, 1, 1),
+                )
+            })?;
+            self.pos += 1;
+            in_flight.push_back(p);
+            if in_flight.len() > 2 {
+                self.last = in_flight.pop_front().expect("non-empty").wait()?;
+            }
+        }
+        while let Some(p) = in_flight.pop_front() {
+            self.last = p.wait()?;
+        }
+        Ok(out.as_slice::<u32>()[..n].to_vec())
+    }
+
+    /// Float offset of slot `sid`'s conv `k` (0 K, 1 V, 2 post-attention, 3 post-FFN) in
+    /// `conv_snap`, or None outside a verify. Each holds MAX_VERIFY rows of [n_conv-1][channels].
+    fn snap_off(&self, sid: usize, k: usize) -> Option<usize> {
+        if self.verify_rows == 0 {
+            return None;
+        }
+        let (kvd, d, nh) = (self.hp.kv_dim(), self.hp.n_embd, self.hp.n_conv - 1);
+        let per_row = |k: usize| if k < 2 { kvd } else { d } * nh;
+        let per_slot: usize = (0..4).map(|k| MAX_VERIFY * per_row(k)).sum();
+        let within: usize = (0..k).map(|k| MAX_VERIFY * per_row(k)).sum();
+        Some(sid * per_slot + within)
+    }
+
+    fn snap_buf(&self, off: Option<usize>) -> crate::runtime::Arg<'_> {
+        match (off, &self.conv_snap) {
+            (Some(o), Some(b)) => buf_at(b, o * 4),
+            // unused by the kernel when snap = 0, but every binding needs a buffer
+            _ => buf(&self.a.tmp),
+        }
+    }
+
+    /// Speculative verify: runs `tokens` (at most MAX_VERIFY) as one causal batch from the current
+    /// position, returning every row's logits, and records the conv histories after each row so
+    /// `rewind` can keep any prefix. The position advances by `tokens.len()`.
+    pub fn verify(&mut self, tokens: &[u32]) -> Result<Vec<Vec<f32>>> {
+        assert!(
+            !tokens.is_empty() && tokens.len() <= MAX_VERIFY,
+            "verify batch of {}",
+            tokens.len()
+        );
+        if self.conv_snap.is_none() {
+            let (kvd, d, nh) = (self.hp.kv_dim(), self.hp.n_embd, self.hp.n_conv - 1);
+            let floats = self.hp.n_slots() * MAX_VERIFY * nh * (2 * kvd + 2 * d);
+            self.conv_snap = Some(self.ctx.buffer(floats * 4)?);
+        }
+        self.verify_rows = tokens.len();
+        let mut rows = Vec::with_capacity(tokens.len());
+        let r = self.prefill_each(tokens, |_, l| rows.push(l.to_vec()));
+        self.verify_rows = 0;
+        r?;
+        Ok(rows)
+    }
+
+    /// After `verify` of n rows, keeps the first `keep` (1..=n): rolls the position back and
+    /// restores every conv history to its state after row keep-1. KV rows past the position are
+    /// dead and get overwritten later.
+    pub fn rewind(&mut self, n: usize, keep: usize) -> Result<()> {
+        assert!(keep >= 1 && keep <= n && n <= MAX_VERIFY && n <= self.pos);
+        self.pos -= n - keep;
+        if keep == n {
+            return Ok(());
+        }
+        let (kvd, d, nh) = (self.hp.kv_dim(), self.hp.n_embd, self.hp.n_conv - 1);
+        self.verify_rows = n;
+        let this = &*self;
+        let r = this.ctx.run(|e| {
+            e.parallel(|e| {
+                for sid in 0..this.hp.n_slots() {
+                    for k in 0..4 {
+                        let ch = if k < 2 { kvd } else { d };
+                        let off =
+                            this.snap_off(sid, k).expect("verify_rows set") + (keep - 1) * nh * ch;
+                        let snap = this.conv_snap.as_ref().expect("allocated by verify");
+                        this.copy(e, snap, off, &this.slots[sid].conv[k], 0, nh * ch)?;
+                    }
+                }
+                Ok(())
+            })
+        });
+        self.verify_rows = 0;
+        self.last = r?;
+        Ok(())
+    }
+
+    /// Starts recording the drafter's target features on every forward (see `captured`).
+    pub fn enable_capture(&mut self) -> Result<()> {
+        assert_eq!(
+            self.hp.n_slots(),
+            48,
+            "drafter feature slots assume the 3-pass layout"
+        );
+        let n = inkling::drafter::N_FEAT * self.max_batch * self.hp.n_embd;
+        self.capture = Some(self.ctx.buffer(n * 4)?);
+        Ok(())
+    }
+
+    /// The drafter features (`N_FEAT * d`, in drafter order) of row `row` of the most recent
+    /// forward. The final-hidden feature exists for every row with `prefill_each` and `step`,
+    /// otherwise only for the last row.
+    pub fn captured(&self, row: usize) -> Vec<f32> {
+        let c = self
+            .capture
+            .as_ref()
+            .expect("enable_capture first")
+            .as_slice::<f32>();
+        let (d, plane) = (self.hp.n_embd, self.max_batch * self.hp.n_embd);
+        (0..inkling::drafter::N_FEAT)
+            .flat_map(|f| {
+                c[f * plane + row * d..f * plane + (row + 1) * d]
+                    .iter()
+                    .copied()
+            })
+            .collect()
+    }
+
     pub fn prefill(&mut self, tokens: &[u32]) -> Result<Vec<f32>> {
         if tokens.is_empty() {
             return Err(Error::Model(inkling::Error::Unsupported(
@@ -1000,6 +1173,7 @@ impl MetalModel {
         second: Second,
         ch: usize,
         nt: usize,
+        snap: Option<usize>,
     ) -> Result<()> {
         let nc = self.hp.n_conv;
         let dyn_heads = if dyn_.is_some() { self.hp.n_head_kv } else { 0 };
@@ -1023,9 +1197,11 @@ impl MetalModel {
                     scale,
                     n_tokens: nt as u32,
                     second: mode,
+                    snap: snap.is_some() as u32,
                 }),
                 buf(res),
                 buf(y2),
+                self.snap_buf(snap),
             ],
             (ch.div_ceil(256), 1, 1),
             (256, 1, 1),
@@ -1133,30 +1309,64 @@ impl MetalModel {
             d: d as u32,
             rank: rank as u32,
         };
+        self.msg_gate_down(e, g, x, x_off, m, m_off, 0, &ga)?;
+        self.msg_gate_up(e, g, x, x_off, m, m_off, out, out_off, 0, &ga)
+    }
+
+    /// Decode gate, first half: z[z_off..z_off+rank] = D [rms(x); rms(m)].
+    #[allow(clippy::too_many_arguments)]
+    fn msg_gate_down(
+        &self,
+        e: &mut Encoder,
+        g: &GateT,
+        x: &Buffer,
+        x_off: usize,
+        m: &Buffer,
+        m_off: usize,
+        z_off: usize,
+        ga: &GateArgs,
+    ) -> Result<()> {
         e.dispatch(
             "msg_gate_down",
             &[
                 buf_at(&self.w, g.down.0),
                 buf_at(x, x_off * 4),
                 buf_at(m, m_off * 4),
-                buf(&a.z),
-                bytes(&ga),
+                buf_at(&self.a.z, z_off * 4),
+                bytes(ga),
             ],
-            (rank, nt, 1),
+            (ga.rank as usize, 1, 1),
             (1024, 1, 1),
-        )?;
+        )
+    }
+
+    /// Decode gate, second half: out = x and m mixed through the forget / gain gates of z.
+    #[allow(clippy::too_many_arguments)]
+    fn msg_gate_up(
+        &self,
+        e: &mut Encoder,
+        g: &GateT,
+        x: &Buffer,
+        x_off: usize,
+        m: &Buffer,
+        m_off: usize,
+        out: &Buffer,
+        out_off: usize,
+        z_off: usize,
+        ga: &GateArgs,
+    ) -> Result<()> {
         e.dispatch(
             "msg_gate_up",
             &[
                 buf_at(&self.w, g.forget.0),
                 buf_at(&self.w, g.gain.0),
-                buf(&a.z),
+                buf_at(&self.a.z, z_off * 4),
                 buf_at(x, x_off * 4),
                 buf_at(m, m_off * 4),
                 buf_at(out, out_off * 4),
-                bytes(&ga),
+                bytes(ga),
             ],
-            (d.div_ceil(MV_SG), nt, 1),
+            ((ga.d as usize).div_ceil(MV_SG), 1, 1),
             (32 * MV_SG, 1, 1),
         )
     }
@@ -1200,7 +1410,9 @@ impl MetalModel {
             situ_beta: hp.situ_beta,
             situ_lin: hp.situ_linear_beta,
         };
-        if nt == 1 {
+        // decode and short batches (speculative verify): one matvec per (token, expert) pair; a
+        // grouped GEMM would fill its 32-token tiles with a token or two per expert
+        if nt <= MAX_VERIFY {
             e.dispatch(
                 &format!("moe_gate_up_{}", lw.exp_kind),
                 &[
@@ -1210,7 +1422,11 @@ impl MetalModel {
                     buf(&a.act),
                     bytes(&moe),
                 ],
-                (hp.n_ff_exp.div_ceil(MV_SG * MOE_NR), hp.n_expert_used, 1),
+                (
+                    hp.n_ff_exp.div_ceil(MV_SG * MOE_NR),
+                    nt * hp.n_expert_used,
+                    1,
+                ),
                 (32 * MV_SG, 1, 1),
             )?;
             return e.dispatch(
@@ -1223,7 +1439,7 @@ impl MetalModel {
                     buf(&a.y),
                     bytes(&moe),
                 ],
-                (d.div_ceil(MV_SG * MOE_NR), 1, 1),
+                (d.div_ceil(MV_SG * MOE_NR), nt, 1),
                 (32 * MV_SG, 1, 1),
             );
         }
@@ -1333,23 +1549,34 @@ impl MetalModel {
         );
         let plane = self.max_batch * d;
         let slot = &self.slots[sid];
+        if let Some(c) = &self.capture
+            && let Some(fi) = inkling::drafter::FEATURE_SLOTS
+                .iter()
+                .position(|&x| x == sid)
+        {
+            self.copy(e, &a.h, 0, c, fi * plane, nt * d)?;
+        }
 
         // attention inputs: planes of a.inp ([3][nt][d]). SWA layers outside loop passes 2-3 feed
         // q, k and v from one input, so only plane 0 is built and normalized.
         let shared_input = lw.is_swa && !msgs;
         let n_planes = if shared_input { 1 } else { 3 };
         match lw.attn_res_query {
-            None => {
+            None => e.parallel(|e| {
                 for j in 0..n_planes {
                     self.copy(e, &a.h, 0, &a.inp, j * plane, nt * d)?;
                 }
-            }
+                Ok(())
+            })?,
             Some(q) => {
                 if lw.is_swa {
                     self.mix(e, &a.blocks, *n_blocks, &a.h, q, 1, &a.inp, nt)?;
-                    for j in 1..n_planes {
-                        self.copy(e, &a.inp, 0, &a.inp, j * plane, nt * d)?;
-                    }
+                    e.parallel(|e| {
+                        for j in 1..n_planes {
+                            self.copy(e, &a.inp, 0, &a.inp, j * plane, nt * d)?;
+                        }
+                        Ok(())
+                    })?;
                 } else {
                     self.mix(e, &a.blocks, *n_blocks, &a.h, q, 3, &a.inp, nt)?;
                 }
@@ -1357,38 +1584,82 @@ impl MetalModel {
         }
         if msgs {
             let gates = &self.loops[il - hp.loop_start].gates;
-            for (j, gate) in gates.iter().take(3).enumerate() {
-                self.msg_gate(
+            if nt == 1 {
+                // the three planes' gates are independent; each gets its own slice of a.z
+                let ga = GateArgs {
+                    d: d as u32,
+                    rank: hp.loop_gate_rank as u32,
+                };
+                let rank = hp.loop_gate_rank;
+                e.parallel(|e| {
+                    for (j, g) in gates.iter().take(3).enumerate() {
+                        self.msg_gate_down(
+                            e,
+                            g,
+                            &a.inp,
+                            j * plane,
+                            &a.msgs,
+                            j * plane,
+                            j * rank,
+                            &ga,
+                        )?;
+                    }
+                    Ok(())
+                })?;
+                e.parallel(|e| {
+                    for (j, g) in gates.iter().take(3).enumerate() {
+                        self.msg_gate_up(
+                            e,
+                            g,
+                            &a.inp,
+                            j * plane,
+                            &a.msgs,
+                            j * plane,
+                            &a.inp,
+                            j * plane,
+                            j * rank,
+                            &ga,
+                        )?;
+                    }
+                    Ok(())
+                })?;
+            } else {
+                for (j, gate) in gates.iter().take(3).enumerate() {
+                    self.msg_gate(
+                        e,
+                        gate,
+                        &a.inp,
+                        j * plane,
+                        &a.msgs,
+                        j * plane,
+                        &a.inp,
+                        j * plane,
+                        nt,
+                    )?;
+                }
+            }
+        }
+        e.parallel(|e| {
+            for j in 0..n_planes {
+                let w = match (lw.attn_norm, lw.qkv_inp_norm) {
+                    (Some(t), _) => t,
+                    (None, Some(ts)) => ts[j],
+                    _ => unreachable!("checked at load"),
+                };
+                self.norm(
                     e,
-                    gate,
                     &a.inp,
                     j * plane,
-                    &a.msgs,
+                    Some(w),
+                    &a.n_qkv,
                     j * plane,
-                    &a.inp,
-                    j * plane,
+                    d,
+                    hp.rms_eps,
                     nt,
                 )?;
             }
-        }
-        for j in 0..n_planes {
-            let w = match (lw.attn_norm, lw.qkv_inp_norm) {
-                (Some(t), _) => t,
-                (None, Some(ts)) => ts[j],
-                _ => unreachable!("checked at load"),
-            };
-            self.norm(
-                e,
-                &a.inp,
-                j * plane,
-                Some(w),
-                &a.n_qkv,
-                j * plane,
-                d,
-                hp.rms_eps,
-                nt,
-            )?;
-        }
+            Ok(())
+        })?;
 
         // projections: one multi-matrix dispatch per distinct input
         let ncv = nkv * hp.n_conv;
@@ -1411,84 +1682,92 @@ impl MetalModel {
             q_side.append(&mut v_side);
             self.proj(e, &a.n_qkv, 0, &q_side, nt)?;
         } else {
-            self.proj(e, &a.n_qkv, 0, &q_side, nt)?;
-            self.proj(e, &a.n_qkv, plane, &k_side, nt)?;
-            self.proj(e, &a.n_qkv, 2 * plane, &v_side, nt)?;
+            e.parallel(|e| {
+                self.proj(e, &a.n_qkv, 0, &q_side, nt)?;
+                self.proj(e, &a.n_qkv, plane, &k_side, nt)?;
+                self.proj(e, &a.n_qkv, 2 * plane, &v_side, nt)
+            })?;
         }
-        self.clip(
-            e,
-            &a.q,
-            0,
-            Some(lw.q_clip),
-            hd,
-            nh,
-            hp.qk_clip,
-            !lw.is_swa,
-            nt,
-        )?;
-
-        // K and V convolve straight into the cache rows pos..pos+nt, with the per-head key clip /
-        // value RMS norm fused in (one threadgroup per KV head)
         let kv_off = self.pos * kvd;
-        let nc = hp.n_conv;
-        for (lin, hist, taps, dynw, cache, mode) in [
-            (
-                &a.k_lin,
-                &slot.conv[0],
-                lw.k_conv,
-                lw.k_conv_proj.map(|_| &a.k_dyn),
-                &slot.k,
-                0u32,
-            ),
-            (
-                &a.v_lin,
-                &slot.conv[1],
-                lw.v_conv,
-                lw.v_conv_proj.map(|_| &a.v_dyn),
-                &slot.v,
-                1u32,
-            ),
-        ] {
-            let dyn_ = dynw.is_some();
-            e.dispatch(
-                if self.kv_f16 {
-                    "conv_head_f16"
-                } else {
-                    "conv_head_f32"
-                },
-                &[
-                    buf(lin),
-                    buf(hist),
-                    buf_at(&self.w, taps.0),
-                    buf(dynw.unwrap_or(lin)),
-                    buf_at(cache, kv_off * self.kv_bytes()),
-                    bytes(&ConvHeadArgs {
-                        kv_dim: kvd as u32,
-                        head_dim: hd as u32,
-                        nc: nc as u32,
-                        dyn_: dyn_ as u32,
-                        scale: 1.0 / (((if dyn_ { 2 } else { 1 }) * nc + 1) as f32).sqrt(),
-                        n_tokens: nt as u32,
-                        mode,
-                        threshold: hp.qk_clip,
-                        eps: hp.rms_eps,
-                    }),
-                ],
-                (nkv, 1, 1),
-                (hd, 1, 1),
+        // q clip, the K and V convs into the cache, and the r clip touch disjoint buffers
+        e.parallel(|e| {
+            self.clip(
+                e,
+                &a.q,
+                0,
+                Some(lw.q_clip),
+                hd,
+                nh,
+                hp.qk_clip,
+                !lw.is_swa,
+                nt,
             )?;
-        }
-        self.clip(
-            e,
-            &a.r,
-            0,
-            Some(lw.rel_clip),
-            nr,
-            nh,
-            hp.rel_clip,
-            !lw.is_swa,
-            nt,
-        )?;
+
+            // K and V convolve straight into the cache rows pos..pos+nt, with the per-head key clip /
+            // value RMS norm fused in (one threadgroup per KV head)
+            let nc = hp.n_conv;
+            for (lin, hist, taps, dynw, cache, mode) in [
+                (
+                    &a.k_lin,
+                    &slot.conv[0],
+                    lw.k_conv,
+                    lw.k_conv_proj.map(|_| &a.k_dyn),
+                    &slot.k,
+                    0u32,
+                ),
+                (
+                    &a.v_lin,
+                    &slot.conv[1],
+                    lw.v_conv,
+                    lw.v_conv_proj.map(|_| &a.v_dyn),
+                    &slot.v,
+                    1u32,
+                ),
+            ] {
+                let dyn_ = dynw.is_some();
+                e.dispatch(
+                    if self.kv_f16 {
+                        "conv_head_f16"
+                    } else {
+                        "conv_head_f32"
+                    },
+                    &[
+                        buf(lin),
+                        buf(hist),
+                        buf_at(&self.w, taps.0),
+                        buf(dynw.unwrap_or(lin)),
+                        buf_at(cache, kv_off * self.kv_bytes()),
+                        bytes(&ConvHeadArgs {
+                            kv_dim: kvd as u32,
+                            head_dim: hd as u32,
+                            nc: nc as u32,
+                            dyn_: dyn_ as u32,
+                            scale: 1.0 / (((if dyn_ { 2 } else { 1 }) * nc + 1) as f32).sqrt(),
+                            n_tokens: nt as u32,
+                            mode,
+                            threshold: hp.qk_clip,
+                            eps: hp.rms_eps,
+                            snap: self.snap_off(sid, mode as usize).is_some() as u32,
+                        }),
+                        self.snap_buf(self.snap_off(sid, mode as usize)),
+                    ],
+                    (nkv, 1, 1),
+                    (hd, 1, 1),
+                )?;
+            }
+            self.clip(
+                e,
+                &a.r,
+                0,
+                Some(lw.rel_clip),
+                nr,
+                nh,
+                hp.rel_clip,
+                !lw.is_swa,
+                nt,
+            )?;
+            Ok(())
+        })?;
         rec(e, "Qcur", s, &a.q, 0, qd)?;
         if !self.kv_f16 {
             rec(e, "Kcur", s, &slot.k, kv_off, kvd)?;
@@ -1655,28 +1934,35 @@ impl MetalModel {
         // post-attention conv, fused with the residual bookkeeping: the first layer of a block
         // pushes its input onto the block list and restarts the stream from the attention output
         let boundary = il.is_multiple_of(hp.attn_res_block);
-        if boundary {
-            assert!(*n_blocks < MAX_BLOCKS, "block list overflow");
-            self.copy(e, &a.h, 0, &a.blocks, *n_blocks * plane, nt * d)?;
-            *n_blocks += 1;
-        }
         let second = if boundary {
             Second::Copy(&a.cur)
         } else {
             Second::AddRes(&a.h, &a.cur)
         };
-        self.conv(
-            e,
-            &a.wo_out,
-            &slot.conv[2],
-            lw.attn_post_conv,
-            None,
-            &a.attn,
-            0,
-            second,
-            d,
-            nt,
-        )?;
+        // on a boundary the conv does not read a.h, so the push can run alongside it
+        let blk = *n_blocks;
+        e.parallel(|e| {
+            if boundary {
+                assert!(blk < MAX_BLOCKS, "block list overflow");
+                self.copy(e, &a.h, 0, &a.blocks, blk * plane, nt * d)?;
+            }
+            self.conv(
+                e,
+                &a.wo_out,
+                &slot.conv[2],
+                lw.attn_post_conv,
+                None,
+                &a.attn,
+                0,
+                second,
+                d,
+                nt,
+                self.snap_off(sid, 2),
+            )
+        })?;
+        if boundary {
+            *n_blocks += 1;
+        }
         rec(e, "attn_out", s, &a.attn, 0, d)?;
         rec(e, "ffn_inp", s, &a.cur, 0, d)?;
 
@@ -1746,6 +2032,7 @@ impl MetalModel {
             Second::AddRes(&a.cur, &a.h),
             d,
             nt,
+            self.snap_off(sid, 3),
         )?;
         rec(e, "ffn_out", s, &a.ffn, 0, d)?;
         rec(e, "l_out", s, &a.h, 0, d)?;
@@ -1859,6 +2146,9 @@ impl MetalModel {
                 hp.rms_eps,
                 nt,
             )?;
+            if let Some(c) = &self.capture {
+                self.copy(e, &a.n, 0, c, 3 * plane, nt * d)?;
+            }
             let mut args = MultiArgs {
                 cols: d as u32,
                 n_seg: 1,
@@ -1918,6 +2208,9 @@ impl MetalModel {
             hp.rms_eps,
             1,
         )?;
+        if let Some(c) = &self.capture {
+            self.copy(e, &a.n, 0, c, 3 * plane + last, d)?;
+        }
         rec(e, "result_norm", None, &a.n, 0, d)?;
         self.mv(e, "mv_q8_0", self.output, &a.n, &a.logits, hp.n_vocab, d, 1)?;
         if hp.final_softcap > 0.0 {

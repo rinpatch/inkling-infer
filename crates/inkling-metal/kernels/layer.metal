@@ -150,6 +150,7 @@ struct ConvArgs {
     float scale;
     uint n_tokens;
     uint second;      // 0: none, 1: y2 = y, 2: y2 = res + y (fused residual add)
+    uint snap;        // 1: also store the history after every token in snap [n_tokens][nc-1][ch]
 };
 
 // For t = 0..n_tokens in order: y[t] = (x[t] + sum_l taps[c][nc-1-l]*x_{t-l}
@@ -157,7 +158,8 @@ struct ConvArgs {
 // hist is [nc-1][ch], oldest first. One thread per channel; tokens are sequential per channel.
 kernel void conv_step(device const float *x [[buffer(0)]], device float *hist [[buffer(1)]], device const float *taps [[buffer(2)]],
                       device const float *dyn [[buffer(3)]], device float *y [[buffer(4)]], constant ConvArgs &a [[buffer(5)]],
-                      device const float *res [[buffer(6)]], device float *y2 [[buffer(7)]], uint c [[thread_position_in_grid]]) {
+                      device const float *res [[buffer(6)]], device float *y2 [[buffer(7)]], device float *snap [[buffer(8)]],
+                      uint c [[thread_position_in_grid]]) {
     if (c >= a.ch) return;
     uint nh = a.nc - 1;
     float xs[8];  // xs[l] = value at backward lag l (nc <= 8)
@@ -179,6 +181,8 @@ kernel void conv_step(device const float *x [[buffer(0)]], device float *hist [[
         if (a.second == 1) y2[i] = out;
         else if (a.second == 2) y2[i] = res[i] + out;
         for (uint l = a.nc - 1; l > 0; --l) xs[l] = xs[l - 1];
+        if (a.snap)
+            for (uint l = 1; l < a.nc; ++l) snap[((ulong)t * nh + nh - l) * a.ch + c] = xs[l];
     }
     for (uint l = 1; l < a.nc; ++l) hist[(nh - l) * a.ch + c] = xs[l];
 }
@@ -417,12 +421,13 @@ struct ConvHeadArgs {
     uint mode;        // 0: L2 clip to `threshold` (keys), 1: RMS norm with `eps` (values)
     float threshold;
     float eps;
+    uint snap;        // as in ConvArgs
 };
 
 template <typename KV>
 kernel void conv_head(device const float *x [[buffer(0)]], device float *hist [[buffer(1)]], device const float *taps [[buffer(2)]],
                       device const float *dynw [[buffer(3)]], device KV *y [[buffer(4)]], constant ConvHeadArgs &a [[buffer(5)]],
-                      uint h [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]]) {
+                      device float *snap [[buffer(6)]], uint h [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]]) {
     threadgroup float scratch[32];
     uint c = h * a.head_dim + tid;
     uint nh = a.nc - 1;
@@ -444,14 +449,18 @@ kernel void conv_head(device const float *x [[buffer(0)]], device float *hist [[
         float f = a.mode == 0 ? min(1.0f, a.threshold / (sqrt(ss) + 1e-6f)) : rsqrt(ss / a.head_dim + a.eps);
         y[(ulong)t * a.kv_dim + c] = KV(out * f);
         for (uint l = a.nc - 1; l > 0; --l) xs[l] = xs[l - 1];
+        if (a.snap)
+            for (uint l = 1; l < a.nc; ++l) snap[((ulong)t * nh + nh - l) * a.kv_dim + c] = xs[l];
     }
     for (uint l = 1; l < a.nc; ++l) hist[(nh - l) * a.kv_dim + c] = xs[l];
 }
 
 template [[host_name("conv_head_f32")]] kernel void conv_head<float>(device const float *, device float *, device const float *,
-                                                                      device const float *, device float *, constant ConvHeadArgs &, uint, uint);
+                                                                      device const float *, device float *, constant ConvHeadArgs &,
+                                                                      device float *, uint, uint);
 template [[host_name("conv_head_f16")]] kernel void conv_head<half>(device const float *, device float *, device const float *,
-                                                                     device const float *, device half *, constant ConvHeadArgs &, uint, uint);
+                                                                     device const float *, device half *, constant ConvHeadArgs &,
+                                                                     device float *, uint, uint);
 
 #define ATTN_INSTANCES(KV, name)                                                                                                        \
     template [[host_name("attn_split_" name)]] kernel void attn_split<KV>(device const float *, device const KV *, device const KV *,     \
@@ -631,3 +640,42 @@ TILED_INSTANCE(float, float, "kv32_f32")
 TILED_INSTANCE(half, float, "kv16_f32")
 TILED_INSTANCE(float, half, "kv32_f16")
 TILED_INSTANCE(half, half, "kv16_f16")
+
+struct ArgmaxArgs {
+    uint n;
+    uint out_index;
+};
+
+// Greedy pick on the GPU: tokens[0] <- argmax(logits) (lowest index on ties), also stored at
+// out[out_index]. tokens[0] is what the next step's embedding lookup reads, so decode steps can be
+// queued back to back without a CPU round trip. One threadgroup of 1024 threads.
+kernel void argmax_token(device const float *logits [[buffer(0)]], device uint *tokens [[buffer(1)]], device uint *out [[buffer(2)]],
+                         constant ArgmaxArgs &a [[buffer(3)]], uint tid [[thread_index_in_threadgroup]],
+                         uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float bv[32];
+    threadgroup uint bi[32];
+    float v = -INFINITY;
+    uint idx = 0xffffffffu;
+    for (uint i = tid; i < a.n; i += 1024) {
+        float x = logits[i];
+        if (x > v) { v = x; idx = i; }
+    }
+    // reduce (value desc, index asc) within the simdgroup, then across simdgroups
+    for (uint o = 16; o > 0; o /= 2) {
+        float v2 = simd_shuffle_down(v, o);
+        uint i2 = simd_shuffle_down(idx, o);
+        if (v2 > v || (v2 == v && i2 < idx)) { v = v2; idx = i2; }
+    }
+    if (lane == 0) { bv[sg] = v; bi[sg] = idx; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+        v = bv[lane];
+        idx = bi[lane];
+        for (uint o = 16; o > 0; o /= 2) {
+            float v2 = simd_shuffle_down(v, o);
+            uint i2 = simd_shuffle_down(idx, o);
+            if (v2 > v || (v2 == v && i2 < idx)) { v = v2; idx = i2; }
+        }
+        if (lane == 0) { tokens[0] = idx; out[a.out_index] = idx; }
+    }
+}

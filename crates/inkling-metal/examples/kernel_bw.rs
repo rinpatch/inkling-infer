@@ -244,6 +244,40 @@ fn main() -> anyhow::Result<()> {
         tq,
     );
 
+    // the same dispatches with no barriers between them (they are independent; the shared output
+    // buffer races, which does not matter for timing)
+    let tp = best(&mut || {
+        Ok(ctx
+            .run(|e| {
+                e.parallel(|e| {
+                    for t in &dense {
+                        let (rows, cols) = (t.dims[1], t.dims[0]);
+                        e.dispatch(
+                            "mv_q8_0",
+                            &[
+                                buf_at(&w, t.offset),
+                                buf(&x),
+                                buf(&ys),
+                                bytes(&MvArgs {
+                                    rows: rows as u32,
+                                    cols: cols as u32,
+                                }),
+                            ],
+                            (rows.div_ceil(MV_SG), 1, 1),
+                            (32 * MV_SG, 1, 1),
+                        )?;
+                    }
+                    Ok(())
+                })
+            })?
+            .gpu_s)
+    })?;
+    report(
+        &format!("mv_q8_0, {} dense, no barriers", dense.len()),
+        dense_b,
+        tp,
+    );
+
     // the same kernel on one large tensor: dispatch ramp-up and drain amortized away
     let lm = g.tensor("output.weight")?;
     let (rows, cols) = (lm.dims[1], lm.dims[0]);
@@ -436,9 +470,18 @@ fn main() -> anyhow::Result<()> {
         m.step(2000 + i, &mut inkling::NoTrace)?;
         step = step.min(m.last.gpu_s);
     }
+    let t0 = std::time::Instant::now();
+    let mut enc = 0.0;
+    for i in 0..32u32 {
+        m.step(3000 + i, &mut inkling::NoTrace)?;
+        enc += m.last.encode_s;
+    }
+    let wall = t0.elapsed().as_secs_f64() / 32.0;
     println!(
-        "decode step: {:.3} ms GPU, {} dispatches",
+        "decode step: {:.3} ms GPU (best), {:.3} ms wall, {:.3} ms encoding, {} dispatches",
         step * 1e3,
+        wall * 1e3,
+        enc / 32.0 * 1e3,
         m.last.n_dispatch
     );
     Ok(())

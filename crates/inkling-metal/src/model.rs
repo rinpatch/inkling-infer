@@ -332,6 +332,8 @@ pub struct MetalModel {
     max_batch: usize,
     pos: usize,
     trace_buf: Buffer,
+    /// KV cache stored as f16 instead of f32 (fixed at construction; see `Options`).
+    kv_f16: bool,
     /// Prefill GEMM tiles in f32 (default: prefill matches decode to ~1e-6) or f16
     /// (INKLING_FAST_PREFILL=1: pp512 +16%, but the error builds up through the KV cache across
     /// ubatches: KL vs llama.cpp on a 13.5k-token prompt rises from 0.04 to 0.23 nats).
@@ -374,6 +376,22 @@ fn opt(g: &Gguf, name: &str, want: DType) -> Result<Option<T>> {
     }
 }
 
+/// Construction options.
+#[derive(Debug, Clone, Copy)]
+pub struct Options {
+    /// Store the KV cache as f16 (half the cache traffic) instead of f32. Default: on unless
+    /// INKLING_KV_F32 is set. Traces of Kcur/Vcur are only available with an f32 cache.
+    pub kv_f16: bool,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Options {
+            kv_f16: std::env::var_os("INKLING_KV_F32").is_none(),
+        }
+    }
+}
+
 /// Records a traced tensor: copies `len` floats from `src` into the trace buffer during the run.
 struct TraceRec {
     name: &'static str,
@@ -385,6 +403,10 @@ struct TraceRec {
 impl MetalModel {
     /// `g` must outlive the model: its mmap backs the weight buffer.
     pub fn new(g: &Gguf, hp: Hparams, max_ctx: usize) -> Result<Self> {
+        Self::with_options(g, hp, max_ctx, Options::default())
+    }
+
+    pub fn with_options(g: &Gguf, hp: Hparams, max_ctx: usize, opts: Options) -> Result<Self> {
         // Validates every tensor shape against the hyperparameters (same rules as the CPU path).
         inkling::weights::Weights::load(g, &hp)?;
         let ctx = Context::new()?;
@@ -466,11 +488,12 @@ impl MetalModel {
         let f = 4usize;
         let (d, kvd, qd) = (hp.n_embd, hp.kv_dim(), hp.q_dim());
         let hist = hp.n_conv - 1;
+        let kv_bytes = if opts.kv_f16 { 2 } else { 4 };
         let mut slots = Vec::with_capacity(hp.n_slots());
         for _ in 0..hp.n_slots() {
             slots.push(SlotBufs {
-                k: ctx.buffer(max_ctx * kvd * f)?,
-                v: ctx.buffer(max_ctx * kvd * f)?,
+                k: ctx.buffer(max_ctx * kvd * kv_bytes)?,
+                v: ctx.buffer(max_ctx * kvd * kv_bytes)?,
                 conv: [
                     ctx.buffer(hist * kvd * f)?,
                     ctx.buffer(hist * kvd * f)?,
@@ -542,6 +565,7 @@ impl MetalModel {
             max_ctx,
             max_batch: MAX_BATCH,
             exact_prefill: std::env::var_os("INKLING_FAST_PREFILL").is_none(),
+            kv_f16: opts.kv_f16,
             pos: 0,
             trace_buf,
             last: RunStats::default(),
@@ -559,6 +583,10 @@ impl MetalModel {
                 _ => true,
             };
         format!("{base}_{}", if f16 { "f16" } else { "f32" })
+    }
+
+    fn kv_bytes(&self) -> usize {
+        if self.kv_f16 { 2 } else { 4 }
     }
 
     pub fn pos(&self) -> usize {
@@ -1377,13 +1405,17 @@ impl MetalModel {
         ] {
             let dyn_ = dynw.is_some();
             e.dispatch(
-                "conv_head",
+                if self.kv_f16 {
+                    "conv_head_f16"
+                } else {
+                    "conv_head_f32"
+                },
                 &[
                     buf(lin),
                     buf(hist),
                     buf_at(&self.w, taps.0),
                     buf(dynw.unwrap_or(lin)),
-                    buf_at(cache, kv_off * 4),
+                    buf_at(cache, kv_off * self.kv_bytes()),
                     bytes(&ConvHeadArgs {
                         kv_dim: kvd as u32,
                         head_dim: hd as u32,
@@ -1412,8 +1444,10 @@ impl MetalModel {
             nt,
         )?;
         rec(e, "Qcur", s, &a.q, 0, qd)?;
-        rec(e, "Kcur", s, &slot.k, kv_off, kvd)?;
-        rec(e, "Vcur", s, &slot.v, kv_off, kvd)?;
+        if !self.kv_f16 {
+            rec(e, "Kcur", s, &slot.k, kv_off, kvd)?;
+            rec(e, "Vcur", s, &slot.v, kv_off, kvd)?;
+        }
         rec(e, "Rcur", s, &a.r, 0, nh * nr)?;
 
         assert_eq!(
@@ -1436,7 +1470,11 @@ impl MetalModel {
                 .clamp(ATTN_SPLIT_MIN, ATTN_SPLIT);
             let n_split = n_keys.div_ceil(split);
             e.dispatch(
-                "attn_split",
+                if self.kv_f16 {
+                    "attn_split_f16"
+                } else {
+                    "attn_split_f32"
+                },
                 &[
                     buf(&a.q),
                     buf(&slot.k),
@@ -1483,7 +1521,11 @@ impl MetalModel {
             rec(e, "kqv_out", s, &a.o, 0, qd)?;
         } else {
             e.dispatch(
-                "attn_flash",
+                if self.kv_f16 {
+                    "attn_flash_f16"
+                } else {
+                    "attn_flash_f32"
+                },
                 &[
                     buf(&a.q),
                     buf(&slot.k),

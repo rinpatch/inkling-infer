@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use inkling::cpu::{CpuModel, State};
 use inkling::weights::Weights;
 use inkling::{Hparams, Trace};
-use inkling_metal::model::MetalModel;
+use inkling_metal::model::{MetalModel, Options};
 
 fn model_path() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("INKLING_MODEL") {
@@ -60,7 +60,7 @@ fn metal_matches_cpu_reference_on_short_prompt() {
     let hp = Hparams::from_gguf(&g).unwrap();
     let cpu = CpuModel::new(hp.clone(), Weights::load(&g, &hp).unwrap());
     let mut cs = State::new(&hp);
-    let mut gpu = MetalModel::new(&g, hp.clone(), 256).unwrap();
+    let mut gpu = MetalModel::with_options(&g, hp.clone(), 256, Options { kv_f16: false }).unwrap();
 
     let mut worst: BTreeMap<String, f32> = BTreeMap::new();
     for (i, &t) in tokens.iter().enumerate() {
@@ -130,7 +130,9 @@ fn metal_matches_cpu_reference_past_the_sliding_window() {
     let hp = Hparams::from_gguf(&g).unwrap();
     let cpu = CpuModel::new(hp.clone(), Weights::load(&g, &hp).unwrap());
     let mut cs = State::new(&hp);
-    let mut gpu = MetalModel::new(&g, hp.clone(), tokens.len() + 1).unwrap();
+    let mut gpu =
+        MetalModel::with_options(&g, hp.clone(), tokens.len() + 1, Options { kv_f16: false })
+            .unwrap();
     let mut worst = 0.0f32;
     for (i, &t) in tokens.iter().enumerate() {
         let (mut a, mut b) = (Sparse(BTreeMap::new()), Sparse(BTreeMap::new()));
@@ -174,9 +176,11 @@ fn prefill_matches_token_by_token_decode() {
     let hp = Hparams::from_gguf(&g).unwrap();
     for n_prompt in [7usize, 300, 600] {
         let (prompt, rest) = (&all[..n_prompt], &all[n_prompt..n_prompt + 5]);
-        let mut batched = MetalModel::new(&g, hp.clone(), 700).unwrap();
+        let mut batched =
+            MetalModel::with_options(&g, hp.clone(), 700, Options { kv_f16: false }).unwrap();
         batched.exact_prefill = true;
-        let mut serial = MetalModel::new(&g, hp.clone(), 700).unwrap();
+        let mut serial =
+            MetalModel::with_options(&g, hp.clone(), 700, Options { kv_f16: false }).unwrap();
         let mut lb = batched.prefill(prompt).unwrap();
         let mut ls = Vec::new();
         for &t in prompt {
@@ -239,9 +243,11 @@ fn fast_prefill_keeps_next_token_distribution() {
     let hp = Hparams::from_gguf(&g).unwrap();
     for n_prompt in [300usize] {
         let (prompt, rest) = (&all[..n_prompt], &all[n_prompt..n_prompt + 5]);
-        let mut fast = MetalModel::new(&g, hp.clone(), 700).unwrap();
+        let mut fast =
+            MetalModel::with_options(&g, hp.clone(), 700, Options { kv_f16: false }).unwrap();
         fast.exact_prefill = false;
-        let mut serial = MetalModel::new(&g, hp.clone(), 700).unwrap();
+        let mut serial =
+            MetalModel::with_options(&g, hp.clone(), 700, Options { kv_f16: false }).unwrap();
         let mut lf = fast.prefill(prompt).unwrap();
         let mut ls = Vec::new();
         for &t in prompt {

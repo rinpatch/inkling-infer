@@ -206,7 +206,8 @@ struct AttnArgs {
 // each key row is one contiguous read; thread c owns output dimension c. The per-query sink logit
 // joins the normalizer at the end and contributes no value.
 // q: [T][n_head][head_dim], r: [T][n_head][n_rel], sinks: [T][n_head], out: [T][n_head][head_dim].
-kernel void attn_flash(device const float *q [[buffer(0)]], device const float *kc [[buffer(1)]], device const float *vc [[buffer(2)]],
+template <typename KV>
+kernel void attn_flash(device const float *q [[buffer(0)]], device const KV *kc [[buffer(1)]], device const KV *vc [[buffer(2)]],
                        device const float *r [[buffer(3)]], device const float *rel_bias [[buffer(4)]],
                        device const float *sinks [[buffer(5)]], device float *out [[buffer(6)]], constant AttnArgs &a [[buffer(7)]],
                        uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
@@ -234,7 +235,7 @@ kernel void attn_flash(device const float *q [[buffer(0)]], device const float *
         uint n = min((uint)ATTN_CHUNK, pos + 1 - j0);
         for (uint kk = sg; kk < n; kk += nsg) {
             uint j = j0 + kk;
-            float4 kv = ((device const float4 *)(kc + (ulong)j * a.kv_dim + kvh * a.head_dim))[lane];
+            float4 kv = float4(((device const vec<KV, 4> *)(kc + (ulong)j * a.kv_dim + kvh * a.head_dim))[lane]);
             uint dist = pos - j;
             for (uint g = 0; g < grp; ++g) {
                 float d = simd_sum(dot(((threadgroup const float4 *)(qs + g * a.head_dim))[lane], kv));
@@ -256,9 +257,9 @@ kernel void attn_flash(device const float *q [[buffer(0)]], device const float *
             lg_t[g][tid] = p;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        device const float *vp = vc + (ulong)j0 * a.kv_dim + kvh * a.head_dim + tid;
+        device const KV *vp = vc + (ulong)j0 * a.kv_dim + kvh * a.head_dim + tid;
         for (uint jj = 0; jj < n; ++jj) {
-            float v = vp[(ulong)jj * a.kv_dim];
+            float v = float(vp[(ulong)jj * a.kv_dim]);
             for (uint g = 0; g < grp; ++g) acc[g] += lg_t[g][jj] * v;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -386,7 +387,8 @@ struct SplitArgs {
 };
 
 // Grid: (n_kv_head, n_split), head_dim threads. Partials: pm/pl [n_head][n_split], pacc [n_head][n_split][head_dim].
-kernel void attn_split(device const float *q [[buffer(0)]], device const float *kc [[buffer(1)]], device const float *vc [[buffer(2)]],
+template <typename KV>
+kernel void attn_split(device const float *q [[buffer(0)]], device const KV *kc [[buffer(1)]], device const KV *vc [[buffer(2)]],
                        device const float *r [[buffer(3)]], device const float *rel_bias [[buffer(4)]], device float *pm [[buffer(5)]],
                        device float *pl [[buffer(6)]], device float *pacc [[buffer(7)]], constant SplitArgs &a [[buffer(8)]],
                        uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
@@ -416,7 +418,7 @@ kernel void attn_split(device const float *q [[buffer(0)]], device const float *
         // contiguous 512-byte read (rows of the cache are kv_dim floats apart)
         for (uint t = sg; t < n; t += nsg) {
             uint j = j0 + t;
-            float4 kv = ((device const float4 *)(kc + (ulong)j * a.kv_dim + kvh * a.head_dim))[lane];
+            float4 kv = float4(((device const vec<KV, 4> *)(kc + (ulong)j * a.kv_dim + kvh * a.head_dim))[lane]);
             uint dist = a.pos - j;
             for (uint g = 0; g < grp; ++g) {
                 float d = simd_sum(dot(((threadgroup const float4 *)(qs + g * a.head_dim))[lane], kv));
@@ -439,9 +441,9 @@ kernel void attn_split(device const float *q [[buffer(0)]], device const float *
             m[g] = m_new;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        device const float *vp = vc + (ulong)j0 * a.kv_dim + kvh * a.head_dim + tid;
+        device const KV *vp = vc + (ulong)j0 * a.kv_dim + kvh * a.head_dim + tid;
         for (uint jj = 0; jj < n; ++jj) {
-            float v = vp[(ulong)jj * a.kv_dim];
+            float v = float(vp[(ulong)jj * a.kv_dim]);
             for (uint g = 0; g < grp; ++g) acc[g] += pl_t[g][jj] * v;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -504,8 +506,9 @@ struct ConvHeadArgs {
     float eps;
 };
 
+template <typename KV>
 kernel void conv_head(device const float *x [[buffer(0)]], device float *hist [[buffer(1)]], device const float *taps [[buffer(2)]],
-                      device const float *dynw [[buffer(3)]], device float *y [[buffer(4)]], constant ConvHeadArgs &a [[buffer(5)]],
+                      device const float *dynw [[buffer(3)]], device KV *y [[buffer(4)]], constant ConvHeadArgs &a [[buffer(5)]],
                       uint h [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]]) {
     threadgroup float scratch[32];
     uint c = h * a.head_dim + tid;
@@ -526,8 +529,23 @@ kernel void conv_head(device const float *x [[buffer(0)]], device float *hist [[
         float out = (xs[0] + acc) * a.scale;
         float ss = tg_sum(out * out, scratch, tid, a.head_dim);
         float f = a.mode == 0 ? min(1.0f, a.threshold / (sqrt(ss) + 1e-6f)) : rsqrt(ss / a.head_dim + a.eps);
-        y[(ulong)t * a.kv_dim + c] = out * f;
+        y[(ulong)t * a.kv_dim + c] = KV(out * f);
         for (uint l = a.nc - 1; l > 0; --l) xs[l] = xs[l - 1];
     }
     for (uint l = 1; l < a.nc; ++l) hist[(nh - l) * a.kv_dim + c] = xs[l];
 }
+
+template [[host_name("conv_head_f32")]] kernel void conv_head<float>(device const float *, device float *, device const float *,
+                                                                      device const float *, device float *, constant ConvHeadArgs &, uint, uint);
+template [[host_name("conv_head_f16")]] kernel void conv_head<half>(device const float *, device float *, device const float *,
+                                                                     device const float *, device half *, constant ConvHeadArgs &, uint, uint);
+
+#define ATTN_INSTANCES(KV, name)                                                                                                        \
+    template [[host_name("attn_flash_" name)]] kernel void attn_flash<KV>(device const float *, device const KV *, device const KV *,     \
+                                                                         device const float *, device const float *, device const float *, \
+                                                                         device float *, constant AttnArgs &, uint2, uint);                \
+    template [[host_name("attn_split_" name)]] kernel void attn_split<KV>(device const float *, device const KV *, device const KV *,     \
+                                                                         device const float *, device const float *, device float *,       \
+                                                                         device float *, device float *, constant SplitArgs &, uint2, uint);
+ATTN_INSTANCES(float, "f32")
+ATTN_INSTANCES(half, "f16")

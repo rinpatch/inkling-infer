@@ -57,3 +57,16 @@ The MLX runner ignores `cache_prompt: false` and reuses a shared prompt prefix, 
 | ours `082f75c`, no drafting | ~325 | 40.4 (@0) | ~315 | 34.2 (@4096) |
 
 Runner stats on this greedy text: 50–65% of drafted tokens accepted, 1.6–3.9 tokens committed per verification step, up to 7 drafted. Gains depend on the text: more predictable continuations accept more drafts.
+
+## Decode: concurrent dispatch groups + GPU-side greedy (5b01504 vs 0f01b77), 2026-11-23
+
+`bench/ab.sh 0f01b77 2`, interleaved rounds, same machine state:
+
+| test | base round 1 / 2 | new round 1 / 2 |
+|---|---|---|
+| pp512 | 329.3 / 333.4 | 339.9 / 311.3 |
+| tg128 @ 0 | 40.47 / 40.48 | **43.43 / 42.16** |
+| pp4096 | 324.2 / 315.1 | 328.1 / 307.3 |
+| tg128 @ 4096 | 34.26 / 34.10 | **36.42 / 35.94** |
+
+Decode +4-7% at empty context and +5-6% at 4K (64% / 54% of the roofline). The concurrent groups alone measured +1-3% in an earlier A/B; the rest is decode_greedy (argmax on the GPU, two command buffers in flight). Prefill moves both ways between rounds (thermal noise in round 2 for both builds).

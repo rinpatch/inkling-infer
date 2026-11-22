@@ -95,3 +95,14 @@ Verify cost grows linearly with the batch: 24 ms for 1 token, then about +10.6 m
 | 7 | 19.3 | 1.22 |
 
 Break-even at best. Speculation pays when an extra token costs much less than a step. Ollama's step is mostly fixed overhead (47 ms), so its verify rounds are cheap relative to a step. Ours is close to the bandwidth floor, and the marginal 10.6 ms is mostly expert reads: the pair matvec streams each (token, expert) pair's weights. 8 consecutive tokens use only 29–31 distinct experts per layer out of 64 pairs, so a kernel that reads each distinct expert once would cut the marginal cost to about 4 ms. A first grouped-by-expert matvec (moe_group + per-expert matvecs, half-blocks dequantized once and reused across pairs) measured slower (115 ms vs 100 for 8 tokens) and was not kept; why it misses the dedup is the open question. Other short-batch changes that landed: per-token message-gate kernels for batches of 8 or fewer (126 → 101 ms), and mv_q8_0_multi with up to 8 tokens.
+
+### Where the marginal verify cost goes, and what did not help
+
+Per-kernel profile, 1-token vs 4-token verify (growth of ~31 ms): MoE expert kernels 61%, the multi-token dense matvec 23%, attention 12% (short batches use the prefill attention kernel, whose 32-query tiles are mostly empty at 4 queries).
+
+Three attempts to stop re-reading shared experts, all measured on an 8-token verify of real tokens (pair matvec: 100 ms):
+- grouped by expert, matvec per expert with a half-block loaded once and reused for its pairs: 115-117 ms (also with dequantization hoisted out of the pair loop);
+- a 32-row x 8-pair simdgroup-MMA tile per expert (weights dequantized once into threadgroup memory per 32-column step): 43/51/61/78 ms for 2/3/4/6 tokens vs 34/44/54/76;
+- the pair matvec walking pairs grouped by expert, so a shared expert's pairs run back to back and hit cache: 103 ms.
+
+The last result says the pair kernel is not limited by DRAM reads at small batch: making the repeat reads cache hits changed nothing. Its limit is the per-element work (IQ4_NL table lookups and FMAs), which repeats for every pair. A win needs dequantized weights reused across tokens without the load imbalance (most experts get 1 pair, a few up to 8) and register pressure the grouped kernel hit.

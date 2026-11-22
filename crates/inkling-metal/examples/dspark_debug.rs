@@ -51,9 +51,10 @@ fn main() -> anyhow::Result<()> {
     }
     for n in [1usize, 2, 3, 4, 6, 8] {
         m.verify(&head[100..100 + n])?;
+        m.rewind(n, 1)?;
         m.verify(&head[100..100 + n])?;
         println!("verify {n}: {:.2} ms GPU", m.last.gpu_s * 1e3);
-        m.rewind(2 * n, 1)?;
+        m.rewind(n, 1)?;
     }
     for _ in 0..3 {
         m.verify(&head[100..108])?;
@@ -74,8 +75,18 @@ fn main() -> anyhow::Result<()> {
         m.rewind(8, 1)?;
     }
     if std::env::var_os("INKLING_PROFILE").is_some() {
-        for (k, t, n) in m.profile_batch(&head[100..108])?.iter().take(12) {
-            println!("  {k:28} {:6.2} ms  x{n}", t * 1e3);
+        // per-kernel totals at 1 and 4 tokens (profiler times are inflated by per-dispatch
+        // encoders; the difference between the two is what grows with the batch)
+        let p1 = m.profile_batch(&head[100..101])?;
+        m.rewind(1, 1)?;
+        let p4 = m.profile_batch(&head[100..104])?;
+        let get = |p: &Vec<(String, f64, usize)>, k: &str| p.iter().find(|x| x.0 == k).map_or(0.0, |x| x.1);
+        let mut rows: Vec<(String, f64, f64)> = p4.iter().map(|(k, t, _)| (k.clone(), get(&p1, k), *t)).collect();
+        rows.sort_by(|a, b| (b.2 - b.1).total_cmp(&(a.2 - a.1)));
+        let (t1, t4): (f64, f64) = (p1.iter().map(|x| x.1).sum(), p4.iter().map(|x| x.1).sum());
+        println!("profile total: 1 token {:.1}  4 tokens {:.1}", t1 * 1e3, t4 * 1e3);
+        for (k, a, b) in rows.iter().take(10) {
+            println!("  {k:28} 1 tok {:7.2}  4 tok {:7.2}  +{:6.2}", a * 1e3, b * 1e3, (b - a) * 1e3);
         }
     }
     let kvd = dc::N_KV * dc::HEAD_DIM;

@@ -305,6 +305,10 @@ pub struct MetalModel {
     max_batch: usize,
     pos: usize,
     trace_buf: Buffer,
+    /// Prefill GEMM tiles in f32 (default: prefill matches decode to ~1e-6) or f16
+    /// (INKLING_FAST_PREFILL=1: pp512 +16%, but the error builds up through the KV cache across
+    /// ubatches: KL vs llama.cpp on a 13.5k-token prompt rises from 0.04 to 0.23 nats).
+    pub exact_prefill: bool,
     /// Stats of the most recent step.
     pub last: RunStats,
 }
@@ -512,10 +516,16 @@ impl MetalModel {
             a,
             max_ctx,
             max_batch: MAX_BATCH,
+            exact_prefill: std::env::var_os("INKLING_FAST_PREFILL").is_none(),
             pos: 0,
             trace_buf,
             last: RunStats::default(),
         })
+    }
+
+    /// Kernel name for the selected prefill tile precision.
+    fn tile(&self, base: &str) -> String {
+        format!("{base}_{}", if self.exact_prefill { "f32" } else { "f16" })
     }
 
     pub fn pos(&self) -> usize {
@@ -752,7 +762,7 @@ impl MetalModel {
             )
         } else {
             e.dispatch(
-                "gemm_q8_0_multi",
+                self.tile("gemm_q8_0_multi").as_str(),
                 &binds,
                 ((start as usize).div_ceil(GEMM_BM), nt.div_ceil(GEMM_BN), 1),
                 (128, 1, 1),
@@ -1123,7 +1133,7 @@ impl MetalModel {
             situ_lin: hp.situ_linear_beta,
         };
         e.dispatch(
-            &format!("moe_gemm_gate_up_{}", lw.exp_kind),
+            &self.tile(&format!("moe_gemm_gate_up_{}", lw.exp_kind)),
             &[
                 buf_at(&self.w, lw.gate_up.0),
                 buf(&a.n),
@@ -1141,7 +1151,7 @@ impl MetalModel {
             (128, 1, 1),
         )?;
         e.dispatch(
-            &format!("moe_gemm_down_{}", lw.exp_kind),
+            &self.tile(&format!("moe_gemm_down_{}", lw.exp_kind)),
             &[
                 buf_at(&self.w, lw.down.0),
                 buf(&a.act),
@@ -1414,7 +1424,7 @@ impl MetalModel {
                         kv_dim: kvd as u32,
                     }),
                 ],
-                (nh, nt, 1),
+                (nkv, nt, 1),
                 (hd, 1, 1),
             )?;
         }
@@ -1439,7 +1449,7 @@ impl MetalModel {
             binds.extend((0..8).map(|_| buf(&a.wo_out)));
             binds.push(bytes(&args));
             e.dispatch(
-                "gemm_q8_0_multi",
+                self.tile("gemm_q8_0_multi").as_str(),
                 &binds,
                 (d.div_ceil(GEMM_BM), nt.div_ceil(GEMM_BN), 1),
                 (128, 1, 1),

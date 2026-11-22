@@ -181,10 +181,12 @@ struct AttnArgs {
 
 #define ATTN_CHUNK 128
 
-// Causal attention for T query tokens, one threadgroup per (head, token). Keys for all T tokens
-// must already be in the cache. Thread c owns output dimension c. Keys are walked in chunks of
-// ATTN_CHUNK with an online softmax (running max m, sum l, accumulator rescaled when m grows);
-// the per-query sink logit joins the normalizer at the end and contributes no value.
+// Causal attention for T query tokens, one threadgroup per (KV head, token) covering the query
+// heads that share the KV head (GQA), so K and V are read once per group. Keys for all T tokens
+// must already be in the cache. Keys are walked in chunks of ATTN_CHUNK with an online softmax
+// (running max m, sum l, accumulator rescaled when m grows); logits use one simdgroup per key so
+// each key row is one contiguous read; thread c owns output dimension c. The per-query sink logit
+// joins the normalizer at the end and contributes no value.
 // q: [T][n_head][head_dim], r: [T][n_head][n_rel], sinks: [T][n_head], out: [T][n_head][head_dim].
 kernel void attn_flash(device const float *q [[buffer(0)]], device const float *kc [[buffer(1)]], device const float *vc [[buffer(2)]],
                        device const float *r [[buffer(3)]], device const float *rel_bias [[buffer(4)]],
@@ -192,56 +194,64 @@ kernel void attn_flash(device const float *q [[buffer(0)]], device const float *
                        uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
     // launched with head_dim threads (the grid is 2-D, so threads_per_threadgroup would have to be too)
     const uint ntg = a.head_dim;
+    const uint grp = a.n_head / a.n_kv_head;
     threadgroup float scratch[32];
-    threadgroup float qs[256];
-    threadgroup float rs[32];
-    threadgroup float pl[ATTN_CHUNK];
-    uint h = tg.x, t = tg.y;
-    uint kvh = h / (a.n_head / a.n_kv_head);
+    threadgroup float qs[4 * 128];
+    threadgroup float rs[4 * 32];
+    threadgroup float lg_t[4][ATTN_CHUNK];
+    uint kvh = tg.x, t = tg.y;
     uint pos = a.pos0 + t;
     uint first = (a.n_swa && pos + 1 > a.n_swa) ? pos + 1 - a.n_swa : 0;
-    device const float *qh = q + ((ulong)t * a.n_head + h) * a.head_dim;
-    device const float *rh = r + ((ulong)t * a.n_head + h) * a.n_rel;
-    for (uint i = tid; i < a.head_dim; i += ntg) qs[i] = qh[i];
-    for (uint i = tid; i < a.n_rel; i += ntg) rs[i] = rh[i];
+    for (uint g = 0; g < grp; ++g) {
+        uint h = kvh * grp + g;
+        for (uint i = tid; i < a.head_dim; i += ntg) qs[g * a.head_dim + i] = q[((ulong)t * a.n_head + h) * a.head_dim + i];
+        for (uint i = tid; i < a.n_rel; i += ntg) rs[g * a.n_rel + i] = r[((ulong)t * a.n_head + h) * a.n_rel + i];
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    float m = -INFINITY, l = 0.0f, acc = 0.0f;
+    uint sg = tid / 32, lane = tid % 32, nsg = ntg / 32;
+    float m[4], l[4], acc[4];
+    for (uint g = 0; g < grp; ++g) { m[g] = -INFINITY; l[g] = 0.0f; acc[g] = 0.0f; }
     for (uint j0 = first; j0 <= pos; j0 += ATTN_CHUNK) {
         uint n = min((uint)ATTN_CHUNK, pos + 1 - j0);
-        float lg = -INFINITY;
-        if (tid < n) {
-            uint j = j0 + tid;
-            device const float4 *kj = (device const float4 *)(kc + (ulong)j * a.kv_dim + kvh * a.head_dim);
-            threadgroup const float4 *q4 = (threadgroup const float4 *)qs;
-            float d = 0.0f;
-            for (uint i = 0; i < a.head_dim / 4; ++i) d += dot(q4[i], kj[i]);
+        for (uint kk = sg; kk < n; kk += nsg) {
+            uint j = j0 + kk;
+            float4 kv = ((device const float4 *)(kc + (ulong)j * a.kv_dim + kvh * a.head_dim))[lane];
             uint dist = pos - j;
-            float bias = 0.0f;
-            if (dist < a.extent) {
-                device const float *bt = rel_bias + dist * a.n_rel;
-                for (uint i = 0; i < a.n_rel; ++i) bias += rs[i] * bt[i];
+            for (uint g = 0; g < grp; ++g) {
+                float d = simd_sum(dot(((threadgroup const float4 *)(qs + g * a.head_dim))[lane], kv));
+                float bias = (dist < a.extent && lane < a.n_rel) ? rs[g * a.n_rel + lane] * rel_bias[dist * a.n_rel + lane] : 0.0f;
+                bias = simd_sum(bias);
+                if (lane == 0) lg_t[g][kk] = d * a.scale + bias;
             }
-            lg = d * a.scale + bias;
         }
-        float m_new = max(m, tg_max(lg, scratch, tid, ntg));
-        float p = tid < n ? exp(lg - m_new) : 0.0f;
-        pl[tid] = p;
-        float corr = exp(m - m_new);
-        l = l * corr + tg_sum(p, scratch, tid, ntg);
-        acc *= corr;
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (tid < a.head_dim) {
-            device const float *vp = vc + (ulong)j0 * a.kv_dim + kvh * a.head_dim + tid;
-            for (uint jj = 0; jj < n; ++jj) acc += pl[jj] * vp[(ulong)jj * a.kv_dim];
+        for (uint g = 0; g < grp; ++g) {
+            float lg = tid < n ? lg_t[g][tid] : -INFINITY;
+            float m_new = max(m[g], tg_max(lg, scratch, tid, ntg));
+            float p = tid < n ? exp(lg - m_new) : 0.0f;
+            float corr = exp(m[g] - m_new);
+            l[g] = l[g] * corr + tg_sum(p, scratch, tid, ntg);
+            acc[g] *= corr;
+            m[g] = m_new;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            lg_t[g][tid] = p;
         }
-        m = m_new;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        device const float *vp = vc + (ulong)j0 * a.kv_dim + kvh * a.head_dim + tid;
+        for (uint jj = 0; jj < n; ++jj) {
+            float v = vp[(ulong)jj * a.kv_dim];
+            for (uint g = 0; g < grp; ++g) acc[g] += lg_t[g][jj] * v;
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    float sink = sinks[(ulong)t * a.n_head + h];
-    float mf = max(m, sink);
-    float total = l * exp(m - mf) + exp(sink - mf);
-    if (tid < a.head_dim) out[((ulong)t * a.n_head + h) * a.head_dim + tid] = acc * exp(m - mf) / total;
+    for (uint g = 0; g < grp; ++g) {
+        uint h = kvh * grp + g;
+        float sink = sinks[(ulong)t * a.n_head + h];
+        float mf = max(m[g], sink);
+        float total = l[g] * exp(m[g] - mf) + exp(sink - mf);
+        out[((ulong)t * a.n_head + h) * a.head_dim + tid] = acc[g] * exp(m[g] - mf) / total;
+    }
 }
 
 // ---- elementwise -------------------------------------------------------------------------------

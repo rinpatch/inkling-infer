@@ -87,6 +87,7 @@ fn check(name: &str, greedy_steps: usize) {
     let g = gguf::Gguf::open(mp).unwrap();
     let hp = Hparams::from_gguf(&g).unwrap();
     let mut m = MetalModel::new(&g, hp.clone(), tokens.len() + greedy_steps + 1).unwrap();
+    m.exact_prefill = true;
     let t0 = std::time::Instant::now();
     let mut logits = m.prefill(&tokens).unwrap();
     println!(

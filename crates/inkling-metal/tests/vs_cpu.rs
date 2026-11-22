@@ -158,8 +158,8 @@ fn swa_tokens(n: usize) -> Option<Vec<u32>> {
     )
 }
 
-/// Batched prefill must leave the model in the same state as token-by-token decode: same
-/// last-token logits, and the same logits for the tokens decoded afterwards.
+/// Batched prefill with f32 tiles must leave the model in the same state as token-by-token decode:
+/// same last-token logits, and the same logits for the tokens decoded afterwards.
 #[test]
 fn prefill_matches_token_by_token_decode() {
     let Some(mp) = model_path() else {
@@ -175,6 +175,7 @@ fn prefill_matches_token_by_token_decode() {
     for n_prompt in [7usize, 300, 600] {
         let (prompt, rest) = (&all[..n_prompt], &all[n_prompt..n_prompt + 5]);
         let mut batched = MetalModel::new(&g, hp.clone(), 700).unwrap();
+        batched.exact_prefill = true;
         let mut serial = MetalModel::new(&g, hp.clone(), 700).unwrap();
         let mut lb = batched.prefill(prompt).unwrap();
         let mut ls = Vec::new();
@@ -195,6 +196,76 @@ fn prefill_matches_token_by_token_decode() {
                 e < 1e-3,
                 "decode step {i} after a {n_prompt}-token prefill diverges: {e:.2e}"
             );
+        }
+    }
+}
+
+fn kl_div(p_logits: &[f32], q_logits: &[f32]) -> f32 {
+    let lse = |x: &[f32]| {
+        let m = x.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        m + x.iter().map(|v| ((v - m) as f64).exp()).sum::<f64>().ln() as f32
+    };
+    let (lp, lq) = (lse(p_logits), lse(q_logits));
+    p_logits
+        .iter()
+        .zip(q_logits)
+        .map(|(&a, &b)| ((a - lp) as f64).exp() * ((a - lp) - (b - lq)) as f64)
+        .sum::<f64>() as f32
+}
+
+fn argmax(x: &[f32]) -> usize {
+    x.iter()
+        .enumerate()
+        .max_by(|a, b| a.1.total_cmp(b.1))
+        .unwrap()
+        .0
+}
+
+/// The opt-in f16 prefill tiles must keep the next-token choice on short prompts: same top-1 and
+/// KL below 1e-2 nats against decode around a 300-token prefill. Measured: KL 4e-5..1.1e-3 at 300
+/// tokens, up to 6.5e-3 at 600, and 0.23 against llama.cpp at 13.5k tokens (vs 0.04 with f32
+/// tiles), which is why f16 is not the default.
+#[test]
+fn fast_prefill_keeps_next_token_distribution() {
+    let Some(mp) = model_path() else {
+        eprintln!("SKIP: model not found");
+        return;
+    };
+    let Some(all) = swa_tokens(605) else {
+        eprintln!("SKIP: fixtures/out/swa missing");
+        return;
+    };
+    let g = gguf::Gguf::open(mp).unwrap();
+    let hp = Hparams::from_gguf(&g).unwrap();
+    for n_prompt in [300usize] {
+        let (prompt, rest) = (&all[..n_prompt], &all[n_prompt..n_prompt + 5]);
+        let mut fast = MetalModel::new(&g, hp.clone(), 700).unwrap();
+        fast.exact_prefill = false;
+        let mut serial = MetalModel::new(&g, hp.clone(), 700).unwrap();
+        let mut lf = fast.prefill(prompt).unwrap();
+        let mut ls = Vec::new();
+        for &t in prompt {
+            ls = serial.step(t, &mut inkling::NoTrace).unwrap();
+        }
+        for step in 0..=rest.len() {
+            let kl = kl_div(&ls, &lf);
+            println!(
+                "{n_prompt} prompt tokens, step {step}: KL {kl:.2e}, rel_l2 {:.2e}",
+                rel_l2(&lf, &ls)
+            );
+            assert_eq!(
+                argmax(&lf),
+                argmax(&ls),
+                "top-1 differs at step {step} after a {n_prompt}-token fast prefill"
+            );
+            assert!(
+                kl < 1e-2,
+                "KL {kl:.2e} at step {step} after a {n_prompt}-token fast prefill"
+            );
+            if step < rest.len() {
+                lf = fast.step(rest[step], &mut inkling::NoTrace).unwrap();
+                ls = serial.step(rest[step], &mut inkling::NoTrace).unwrap();
+            }
         }
     }
 }

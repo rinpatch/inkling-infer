@@ -136,6 +136,7 @@ struct ConvArgs {
     uint dyn_heads;   // 0 = static only
     float scale;
     uint n_tokens;
+    uint second;      // 0: none, 1: y2 = y, 2: y2 = res + y (fused residual add)
 };
 
 // For t = 0..n_tokens in order: y[t] = (x[t] + sum_l taps[c][nc-1-l]*x_{t-l}
@@ -143,7 +144,7 @@ struct ConvArgs {
 // hist is [nc-1][ch], oldest first. One thread per channel; tokens are sequential per channel.
 kernel void conv_step(device const float *x [[buffer(0)]], device float *hist [[buffer(1)]], device const float *taps [[buffer(2)]],
                       device const float *dyn [[buffer(3)]], device float *y [[buffer(4)]], constant ConvArgs &a [[buffer(5)]],
-                      uint c [[thread_position_in_grid]]) {
+                      device const float *res [[buffer(6)]], device float *y2 [[buffer(7)]], uint c [[thread_position_in_grid]]) {
     if (c >= a.ch) return;
     uint nh = a.nc - 1;
     float xs[8];  // xs[l] = value at backward lag l (nc <= 8)
@@ -159,7 +160,11 @@ kernel void conv_step(device const float *x [[buffer(0)]], device float *hist [[
             device const float *dt = dyn + ((ulong)t * a.dyn_heads + h) * a.nc;
             for (uint l = 0; l < a.nc; ++l) acc += dt[l] * xs[l];
         }
-        y[(ulong)t * a.ch + c] = (xs[0] + acc) * a.scale;
+        float out = (xs[0] + acc) * a.scale;
+        ulong i = (ulong)t * a.ch + c;
+        y[i] = out;
+        if (a.second == 1) y2[i] = out;
+        else if (a.second == 2) y2[i] = res[i] + out;
         for (uint l = a.nc - 1; l > 0; --l) xs[l] = xs[l - 1];
     }
     for (uint l = 1; l < a.nc; ++l) hist[(nh - l) * a.ch + c] = xs[l];
@@ -441,9 +446,11 @@ struct CombineAttnArgs {
 };
 
 // out[h] = sum_s acc_s exp(m_s - M) / (sum_s l_s exp(m_s - M) + exp(sink - M)). Grid: n_head, head_dim threads.
+// Also applies the output gate: gate[i] <- out[i] * sigmoid(gate[i]) (in place).
 kernel void attn_combine(device const float *pm [[buffer(0)]], device const float *pl [[buffer(1)]], device const float *pacc [[buffer(2)]],
                          device const float *sinks [[buffer(3)]], device float *out [[buffer(4)]], constant CombineAttnArgs &a [[buffer(5)]],
-                         uint h [[threadgroup_position_in_grid]], uint c [[thread_position_in_threadgroup]]) {
+                         device float *gate [[buffer(6)]], uint h [[threadgroup_position_in_grid]],
+                         uint c [[thread_position_in_threadgroup]]) {
     float sink = sinks[h];
     float M = sink;
     for (uint s = 0; s < a.n_split; ++s) M = max(M, pm[h * a.n_split + s]);
@@ -454,5 +461,14 @@ kernel void attn_combine(device const float *pm [[buffer(0)]], device const floa
         total += pl[idx] * w;
         acc += pacc[(ulong)idx * a.head_dim + c] * w;
     }
-    out[h * a.head_dim + c] = acc / total;
+    uint i = h * a.head_dim + c;
+    float o = acc / total;
+    out[i] = o;
+    gate[i] = o * sigmoidf(gate[i]);
+}
+
+// g[i] = o[i] * sigmoid(g[i]): the attention output gate, written over the gate logits.
+kernel void gate_mul(device const float *o [[buffer(0)]], device float *g [[buffer(1)]], constant NArgs &a [[buffer(2)]],
+                     uint i [[thread_position_in_grid]]) {
+    if (i < a.n) g[i] = o[i] * sigmoidf(g[i]);
 }

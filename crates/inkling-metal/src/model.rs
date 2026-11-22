@@ -63,6 +63,17 @@ struct ConvArgs {
     dyn_heads: u32,
     scale: f32,
     n_tokens: u32,
+    second: u32,
+}
+
+/// Optional second output of a conv dispatch.
+#[derive(Clone, Copy)]
+enum Second<'b> {
+    None,
+    /// `y2 = y`
+    Copy(&'b Buffer),
+    /// `y2 = res + y`
+    AddRes(&'b Buffer, &'b Buffer),
 }
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -182,9 +193,9 @@ pub const MAX_BATCH: usize = 512;
 const MOE_NR: usize = 2;
 const MAX_BLOCKS: usize = 8;
 
-/// Trace hook used while encoding: (encoder, name, slot, source buffer, float count).
+/// Trace hook used while encoding: (encoder, name, slot, source buffer, float offset, float count).
 type RecFn<'a> =
-    dyn FnMut(&mut Encoder, &'static str, Option<usize>, &Buffer, usize) -> Result<()> + 'a;
+    dyn FnMut(&mut Encoder, &'static str, Option<usize>, &Buffer, usize, usize) -> Result<()> + 'a;
 
 /// Byte offset of a tensor inside the model buffer.
 #[derive(Clone, Copy)]
@@ -252,8 +263,6 @@ struct Act {
     q: Buffer,
     k_lin: Buffer,
     v_lin: Buffer,
-    k: Buffer,
-    v: Buffer,
     k_dyn: Buffer,
     v_dyn: Buffer,
     r: Buffer,
@@ -465,8 +474,6 @@ impl MetalModel {
             q: nb(ub * qd)?,
             k_lin: nb(ub * kvd)?,
             v_lin: nb(ub * kvd)?,
-            k: nb(ub * kvd)?,
-            v: nb(ub * kvd)?,
             k_dyn: nb(ub * hp.n_head_kv * hp.n_conv)?,
             v_dyn: nb(ub * hp.n_head_kv * hp.n_conv)?,
             r: nb(ub * hp.n_head * hp.n_rel)?,
@@ -576,6 +583,7 @@ impl MetalModel {
                            name: &'static str,
                            slot: Option<usize>,
                            src: &Buffer,
+                           src_off: usize,
                            len: usize|
              -> Result<()> {
                 if cursor < recs.len() && recs[cursor].name == name && recs[cursor].slot == slot {
@@ -584,7 +592,7 @@ impl MetalModel {
                     e.dispatch(
                         "copy_f32",
                         &[
-                            buf(src),
+                            buf_at(src, src_off * 4),
                             buf_at(&this.trace_buf, off * 4),
                             bytes(&NArgs {
                                 n: len as u32,
@@ -627,7 +635,7 @@ impl MetalModel {
             this.a.tokens.write(chunk);
             self.last = this
                 .ctx
-                .run(|e| this.encode(e, chunk.len(), &mut |_, _, _, _, _| Ok(())))?;
+                .run(|e| this.encode(e, chunk.len(), &mut |_, _, _, _, _, _| Ok(())))?;
             self.pos += chunk.len();
         }
         Ok(self.a.logits.as_slice::<f32>()[..self.hp.n_vocab].to_vec())
@@ -645,7 +653,7 @@ impl MetalModel {
         let this = &*self;
         this.a.tokens.write(tokens);
         let per = this.ctx.profile(4096, |e| {
-            this.encode(e, tokens.len(), &mut |_, _, _, _, _| Ok(()))
+            this.encode(e, tokens.len(), &mut |_, _, _, _, _, _| Ok(()))
         })?;
         self.pos += tokens.len();
         let mut agg: std::collections::HashMap<String, (f64, usize)> =
@@ -877,6 +885,8 @@ impl MetalModel {
         )
     }
 
+    /// Causal short conv over `nt` tokens. `y` is written at float offset `y_off` (the K/V convs
+    /// write straight into the cache row); `second` optionally also writes `y` or `res + y`.
     #[allow(clippy::too_many_arguments)]
     fn conv(
         &self,
@@ -886,12 +896,19 @@ impl MetalModel {
         taps: T,
         dyn_: Option<&Buffer>,
         y: &Buffer,
+        y_off: usize,
+        second: Second,
         ch: usize,
         nt: usize,
     ) -> Result<()> {
         let nc = self.hp.n_conv;
         let dyn_heads = if dyn_.is_some() { self.hp.n_head_kv } else { 0 };
         let scale = 1.0 / (((if dyn_.is_some() { 2 } else { 1 }) * nc + 1) as f32).sqrt();
+        let (mode, res, y2) = match second {
+            Second::None => (0, x, x),
+            Second::Copy(o) => (1, x, o),
+            Second::AddRes(r, o) => (2, r, o),
+        };
         e.dispatch(
             "conv_step",
             &[
@@ -899,26 +916,31 @@ impl MetalModel {
                 buf(hist),
                 buf_at(&self.w, taps.0),
                 buf(dyn_.unwrap_or(x)),
-                buf(y),
+                buf_at(y, y_off * 4),
                 bytes(&ConvArgs {
                     ch: ch as u32,
                     nc: nc as u32,
                     dyn_heads: dyn_heads as u32,
                     scale,
                     n_tokens: nt as u32,
+                    second: mode,
                 }),
+                buf(res),
+                buf(y2),
             ],
             (ch.div_ceil(256), 1, 1),
             (256, 1, 1),
         )
     }
 
-    /// Per-head L2 clip (optionally scaled, optionally times tau(position)) of `[nt][heads][dim]`.
+    /// Per-head L2 clip (optionally scaled, optionally times tau(position)) of `[nt][heads][dim]`
+    /// starting at float offset `x_off`.
     #[allow(clippy::too_many_arguments)]
     fn clip(
         &self,
         e: &mut Encoder,
         x: &Buffer,
+        x_off: usize,
         scale: Option<T>,
         dim: usize,
         heads: usize,
@@ -930,7 +952,7 @@ impl MetalModel {
         e.dispatch(
             "clip_heads",
             &[
-                buf(x),
+                buf_at(x, x_off * 4),
                 match scale {
                     Some(t) => buf_at(&self.w, t.0),
                     None => buf(x),
@@ -1213,18 +1235,22 @@ impl MetalModel {
         let plane = self.max_batch * d;
         let slot = &self.slots[sid];
 
-        // attention inputs: planes 0..3 of a.inp ([3][nt][d])
+        // attention inputs: planes of a.inp ([3][nt][d]). SWA layers outside loop passes 2-3 feed
+        // q, k and v from one input, so only plane 0 is built and normalized.
+        let shared_input = lw.is_swa && !msgs;
+        let n_planes = if shared_input { 1 } else { 3 };
         match lw.attn_res_query {
             None => {
-                for j in 0..3 {
+                for j in 0..n_planes {
                     self.copy(e, &a.h, 0, &a.inp, j * plane, nt * d)?;
                 }
             }
             Some(q) => {
                 if lw.is_swa {
                     self.mix(e, &a.blocks, *n_blocks, &a.h, q, 1, &a.inp, nt)?;
-                    self.copy(e, &a.inp, 0, &a.inp, plane, nt * d)?;
-                    self.copy(e, &a.inp, 0, &a.inp, 2 * plane, nt * d)?;
+                    for j in 1..n_planes {
+                        self.copy(e, &a.inp, 0, &a.inp, j * plane, nt * d)?;
+                    }
                 } else {
                     self.mix(e, &a.blocks, *n_blocks, &a.h, q, 3, &a.inp, nt)?;
                 }
@@ -1246,7 +1272,7 @@ impl MetalModel {
                 )?;
             }
         }
-        for j in 0..3 {
+        for j in 0..n_planes {
             let w = match (lw.attn_norm, lw.qkv_inp_norm) {
                 (Some(t), _) => t,
                 (None, Some(ts)) => ts[j],
@@ -1265,8 +1291,7 @@ impl MetalModel {
             )?;
         }
 
-        // projections: one multi-matrix dispatch per distinct input (all of them share n_q on SWA
-        // layers outside the later loop passes, where q/k/v inputs are identical)
+        // projections: one multi-matrix dispatch per distinct input
         let ncv = nkv * hp.n_conv;
         let mut q_side: Vec<(T, usize, &Buffer)> = vec![
             (lw.wq, qd, &a.q),
@@ -1282,7 +1307,7 @@ impl MetalModel {
         if let Some(p) = lw.v_conv_proj {
             v_side.push((p, ncv, &a.v_dyn));
         }
-        if lw.is_swa && !msgs {
+        if shared_input {
             q_side.append(&mut k_side);
             q_side.append(&mut v_side);
             self.proj(e, &a.n_qkv, 0, &q_side, nt)?;
@@ -1291,32 +1316,49 @@ impl MetalModel {
             self.proj(e, &a.n_qkv, plane, &k_side, nt)?;
             self.proj(e, &a.n_qkv, 2 * plane, &v_side, nt)?;
         }
-        self.clip(e, &a.q, Some(lw.q_clip), hd, nh, hp.qk_clip, !lw.is_swa, nt)?;
+        self.clip(
+            e,
+            &a.q,
+            0,
+            Some(lw.q_clip),
+            hd,
+            nh,
+            hp.qk_clip,
+            !lw.is_swa,
+            nt,
+        )?;
+
+        // K and V convolve straight into the cache rows pos..pos+nt; clip / norm run there in place
+        let kv_off = self.pos * kvd;
         self.conv(
             e,
             &a.k_lin,
             &slot.conv[0],
             lw.k_conv,
             lw.k_conv_proj.map(|_| &a.k_dyn),
-            &a.k,
+            &slot.k,
+            kv_off,
+            Second::None,
             kvd,
             nt,
         )?;
-        self.clip(e, &a.k, None, hd, nkv, hp.qk_clip, false, nt)?;
+        self.clip(e, &slot.k, kv_off, None, hd, nkv, hp.qk_clip, false, nt)?;
         self.conv(
             e,
             &a.v_lin,
             &slot.conv[1],
             lw.v_conv,
             lw.v_conv_proj.map(|_| &a.v_dyn),
-            &a.v,
+            &slot.v,
+            kv_off,
+            Second::None,
             kvd,
             nt,
         )?;
         e.dispatch(
             "rms_heads",
             &[
-                buf(&a.v),
+                buf_at(&slot.v, kv_off * 4),
                 bytes(&NormArgs {
                     n: hd as u32,
                     eps: hp.rms_eps,
@@ -1329,6 +1371,7 @@ impl MetalModel {
         self.clip(
             e,
             &a.r,
+            0,
             Some(lw.rel_clip),
             nr,
             nh,
@@ -1336,19 +1379,16 @@ impl MetalModel {
             !lw.is_swa,
             nt,
         )?;
-        rec(e, "Qcur", s, &a.q, qd)?;
-        rec(e, "Kcur", s, &a.k, kvd)?;
-        rec(e, "Vcur", s, &a.v, kvd)?;
-        rec(e, "Rcur", s, &a.r, nh * nr)?;
-
-        // append the batch's keys and values at positions pos..pos+nt
-        self.copy(e, &a.k, 0, &slot.k, self.pos * kvd, nt * kvd)?;
-        self.copy(e, &a.v, 0, &slot.v, self.pos * kvd, nt * kvd)?;
+        rec(e, "Qcur", s, &a.q, 0, qd)?;
+        rec(e, "Kcur", s, &slot.k, kv_off, kvd)?;
+        rec(e, "Vcur", s, &slot.v, kv_off, kvd)?;
+        rec(e, "Rcur", s, &a.r, 0, nh * nr)?;
 
         assert_eq!(
             hd, 128,
             "attention kernels run one thread per head dimension"
         );
+        // gated attention output ends up in a.gate (decode: fused into the combine step)
         if nt == 1 {
             // decode: split the visible keys into blocks across threadgroups, one per (kv head,
             // block), then merge the blocks per head
@@ -1397,10 +1437,12 @@ impl MetalModel {
                         head_dim: hd as u32,
                         n_split: n_split as u32,
                     }),
+                    buf(&a.gate),
                 ],
                 (nh, 1, 1),
                 (hd, 1, 1),
             )?;
+            rec(e, "kqv_out", s, &a.o, 0, qd)?;
         } else {
             e.dispatch(
                 "attn_flash",
@@ -1427,11 +1469,24 @@ impl MetalModel {
                 (nkv, nt, 1),
                 (hd, 1, 1),
             )?;
+            rec(e, "kqv_out", s, &a.o, 0, qd)?;
+            // gate <- o * sigmoid(gate)
+            e.dispatch(
+                "gate_mul",
+                &[
+                    buf(&a.o),
+                    buf(&a.gate),
+                    bytes(&NArgs {
+                        n: (nt * qd) as u32,
+                        f: 0.0,
+                    }),
+                ],
+                ((nt * qd).div_ceil(256), 1, 1),
+                (256, 1, 1),
+            )?;
         }
-        rec(e, "kqv_out", s, &a.o, qd)?;
-        self.eltwise(e, "sigmoid_mul", &[&a.o, &a.gate], nt * qd, 0.0)?;
         if nt == 1 {
-            self.mv(e, "mv_q8_0", lw.wo, &a.o, &a.wo_out, d, qd, 1)?;
+            self.mv(e, "mv_q8_0", lw.wo, &a.gate, &a.wo_out, d, qd, 1)?;
         } else {
             let mut args = MultiArgs {
                 cols: qd as u32,
@@ -1445,7 +1500,7 @@ impl MetalModel {
                 start: 0,
                 rows: d as u32,
             };
-            let mut binds = vec![buf(&self.w), buf(&a.o)];
+            let mut binds = vec![buf(&self.w), buf(&a.gate)];
             binds.extend((0..8).map(|_| buf(&a.wo_out)));
             binds.push(bytes(&args));
             e.dispatch(
@@ -1455,6 +1510,20 @@ impl MetalModel {
                 (128, 1, 1),
             )?;
         }
+
+        // post-attention conv, fused with the residual bookkeeping: the first layer of a block
+        // pushes its input onto the block list and restarts the stream from the attention output
+        let boundary = il.is_multiple_of(hp.attn_res_block);
+        if boundary {
+            assert!(*n_blocks < MAX_BLOCKS, "block list overflow");
+            self.copy(e, &a.h, 0, &a.blocks, *n_blocks * plane, nt * d)?;
+            *n_blocks += 1;
+        }
+        let second = if boundary {
+            Second::Copy(&a.cur)
+        } else {
+            Second::AddRes(&a.h, &a.cur)
+        };
         self.conv(
             e,
             &a.wo_out,
@@ -1462,21 +1531,13 @@ impl MetalModel {
             lw.attn_post_conv,
             None,
             &a.attn,
+            0,
+            second,
             d,
             nt,
         )?;
-        rec(e, "attn_out", s, &a.attn, d)?;
-
-        // residual bookkeeping: the first layer of a block pushes its input onto the block list
-        if il.is_multiple_of(hp.attn_res_block) {
-            assert!(*n_blocks < MAX_BLOCKS, "block list overflow");
-            self.copy(e, &a.h, 0, &a.blocks, *n_blocks * plane, nt * d)?;
-            *n_blocks += 1;
-            self.copy(e, &a.attn, 0, &a.cur, 0, nt * d)?;
-        } else {
-            self.eltwise(e, "add", &[&a.h, &a.attn, &a.cur], nt * d, 0.0)?;
-        }
-        rec(e, "ffn_inp", s, &a.cur, d)?;
+        rec(e, "attn_out", s, &a.attn, 0, d)?;
+        rec(e, "ffn_inp", s, &a.cur, 0, d)?;
 
         // MoE
         self.mix(
@@ -1504,7 +1565,7 @@ impl MetalModel {
             d,
             nt,
         )?;
-        rec(e, "ffn_moe_logits", s, &a.router_logits, hp.n_expert)?;
+        rec(e, "ffn_moe_logits", s, &a.router_logits, 0, hp.n_expert)?;
         let Some(bias) = lw.exp_probs_b else {
             return Err(Error::Model(inkling::Error::Unsupported(
                 "Metal path needs exp_probs_b".into(),
@@ -1527,7 +1588,8 @@ impl MetalModel {
             (hp.n_expert, 1, 1),
         )?;
         self.moe(e, lw, nt)?;
-        rec(e, "ffn_moe_out", s, &a.y, d)?;
+        rec(e, "ffn_moe_out", s, &a.y, 0, d)?;
+        // post-FFN conv fused with the residual add: h = cur + conv(y)
         self.conv(
             e,
             &a.y,
@@ -1535,12 +1597,13 @@ impl MetalModel {
             lw.ffn_post_conv,
             None,
             &a.ffn,
+            0,
+            Second::AddRes(&a.cur, &a.h),
             d,
             nt,
         )?;
-        rec(e, "ffn_out", s, &a.ffn, d)?;
-        self.eltwise(e, "add", &[&a.cur, &a.ffn, &a.h], nt * d, 0.0)?;
-        rec(e, "l_out", s, &a.h, d)?;
+        rec(e, "ffn_out", s, &a.ffn, 0, d)?;
+        rec(e, "l_out", s, &a.h, 0, d)?;
         Ok(())
     }
 
@@ -1649,7 +1712,7 @@ impl MetalModel {
             hp.rms_eps,
             1,
         )?;
-        rec(e, "result_norm", None, &a.n, d)?;
+        rec(e, "result_norm", None, &a.n, 0, d)?;
         self.mv(e, "mv_q8_0", self.output, &a.n, &a.logits, hp.n_vocab, d, 1)?;
         if hp.final_softcap > 0.0 {
             self.eltwise(
@@ -1660,7 +1723,7 @@ impl MetalModel {
                 hp.final_softcap,
             )?;
         }
-        rec(e, "result_output", None, &a.logits, hp.n_vocab)?;
+        rec(e, "result_output", None, &a.logits, 0, hp.n_vocab)?;
         Ok(())
     }
 }

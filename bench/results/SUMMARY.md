@@ -102,3 +102,8 @@ llama.cpp through llama-server (`llama-speculative` can't create the DSpark draf
 | 7 | 19.64 (153 / 694) | 19.3 (1.22) |
 
 Speculation loses in both engines on this machine: verifying extra tokens of this MoE model costs about as much as it saves (docs/dspark.md). #32773 reports +68% on an RX 9070 XT, a GPU with far more compute per byte of bandwidth. llama.cpp accepts slightly more drafts (72% vs 67% at 1 draft).
+
+## Prefill experiments, 2026-11-23
+
+- Token-parallel short convolutions (committed): pp512 +7% / +1%, pp4096 −2% / +3% in a noisy two-round A/B; decode unchanged.
+- Relative bias computed per score inside attn_tiled instead of the rel_table pass (reverted): pp4096 288 / 276 vs 338 / 313 (−12–15%), pp512 −1–3%. Sixteen extra multiply-adds and a device load per score stall the MMA loop more than the 25 MB/layer table costs. llama.cpp's #32808 gathers precomputed bias values in its kernel instead.

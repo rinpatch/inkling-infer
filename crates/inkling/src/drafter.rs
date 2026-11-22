@@ -339,6 +339,19 @@ impl Drafter {
         anchor: u32,
         lm_head: &dyn Fn(&[f32]) -> Vec<f32>,
     ) -> Vec<u32> {
+        self.walk_topk(st, h, anchor, lm_head, None)
+    }
+
+    /// `walk`, optionally choosing each draft only among the `k` best tokens of the base logits
+    /// (the Markov correction is then needed for k tokens instead of the whole vocabulary).
+    pub fn walk_topk(
+        &self,
+        st: &DraftState,
+        h: &[Vec<f32>],
+        anchor: u32,
+        lm_head: &dyn Fn(&[f32]) -> Vec<f32>,
+        k: Option<usize>,
+    ) -> Vec<u32> {
         let f_rnn = self.mix(&st.last_feat, N_LAYER, &self.markov_norm);
         let mut state = vec![0.0f32; RANK];
         let mut prev = anchor as usize;
@@ -362,11 +375,20 @@ impl Drafter {
                 *a += b;
             }
             let (base, bias) = (lm_head(hs), lm_head(&hid));
-            let mut best = 0usize;
+            let cand: Vec<usize> = match k {
+                None => (0..base.len()).collect(),
+                Some(k) => {
+                    let mut idx: Vec<usize> = (0..base.len()).collect();
+                    idx.select_nth_unstable_by(k, |a, b| base[*b].total_cmp(&base[*a]));
+                    idx.truncate(k);
+                    idx
+                }
+            };
+            let mut best = cand[0];
             let mut best_v = f32::NEG_INFINITY;
-            for (i, (a, b)) in base.iter().zip(&bias).enumerate() {
-                let v = softcap(a + b, SOFTCAP);
-                if v > best_v {
+            for &i in &cand {
+                let v = softcap(base[i] + bias[i], SOFTCAP);
+                if v > best_v || (v == best_v && i < best) {
                     best_v = v;
                     best = i;
                 }

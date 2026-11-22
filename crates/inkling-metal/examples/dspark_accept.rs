@@ -65,7 +65,10 @@ fn main() -> anyhow::Result<()> {
     let t0 = std::time::Instant::now();
     while generated < n_gen {
         let h = dr.block_hidden(&ds, &embed(anchor));
-        let drafts = dr.walk(&ds, &h, anchor, &lm_head);
+        let topk = std::env::var("DSPARK_TOPK")
+            .ok()
+            .map(|v| v.parse().unwrap());
+        let drafts = dr.walk_topk(&ds, &h, anchor, &lm_head, topk);
         // the target's greedy tokens after the anchor, as far as the drafts keep matching
         let mut cur = anchor;
         let mut n_acc = 0;

@@ -70,6 +70,8 @@ The f32 CPU drafter fed with our IQ4_NL model's features and checked against its
 
 Ollama with the original NVFP4 weights logged 1.56–1.67 accepted per round in three of four runs (2.37 in one) on the same kind of prompt. So the GGUF's different hidden states cost no measurable acceptance, and distillation is not needed. With ~2.8 tokens per round, the gain is 2.8 / (verify cost + draft cost) in decode-step units.
 
+Choosing each draft only among the top-k tokens of the base logits (so the Markov correction is needed for k tokens, not the whole vocabulary) keeps acceptance unchanged on swa.txt: top-4 1.84, top-16 1.77, top-64 1.83 accepted per round vs 1.83 for the full vocabulary. The Metal drafter therefore skips W_fold: per step it computes `hid = hidden_out · latent + b` and dots it with the output-head rows of 8 candidates.
+
 ## Risks and checks before building all of it
 
 - **Acceptance with GGUF features.** The drafter was trained on the original model's hidden states and tokens. Our IQ4_NL features differ by a few % at deep layers, and our greedy tokens differ where the two models disagree. Estimate: per-token acceptance about 0.75 → 0.70, so about 15% less speedup than with the original weights.

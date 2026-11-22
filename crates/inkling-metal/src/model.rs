@@ -344,9 +344,10 @@ pub struct MetalModel {
     trace_buf: Buffer,
     /// KV cache stored as f16 instead of f32 (fixed at construction; see `Options`).
     kv_f16: bool,
-    /// Prefill GEMM tiles in f32 (default: prefill matches decode to ~1e-6) or f16
-    /// (INKLING_FAST_PREFILL=1: pp512 +16%, but the error builds up through the KV cache across
-    /// ubatches: KL vs llama.cpp on a 13.5k-token prompt rises from 0.04 to 0.23 nats).
+    /// Prefill GEMM and attention tiles in f32 (INKLING_EXACT_PREFILL=1: prefill matches decode to
+    /// ~1e-6) instead of f16 (default, ~16% faster prefill). Over all 3810 positions of the swa
+    /// fixture, f16 tiles leave KL vs llama.cpp unchanged (mean 4.8e-3 vs 4.7e-3) and move us from
+    /// our exact run by a mean 2.1e-3 (tests/quality.rs).
     pub exact_prefill: bool,
     /// Stats of the most recent step.
     pub last: RunStats,
@@ -389,17 +390,17 @@ fn opt(g: &Gguf, name: &str, want: DType) -> Result<Option<T>> {
 /// Construction options.
 #[derive(Debug, Clone, Copy)]
 pub struct Options {
-    /// Store the KV cache as f16 (half the memory) instead of f32. Opt-in (INKLING_KV_F16=1): it is
-    /// accurate (identical attention outputs for identical values), but its rounding perturbs
-    /// near-tied MoE routing decisions, so the exact prefill-vs-decode and single-position checks
-    /// stop being bit-faithful. Kcur/Vcur traces need an f32 cache.
+    /// Store the KV cache as f16 (half the memory; default) instead of f32 (INKLING_KV_F32=1).
+    /// Same accuracy over all positions (tests/quality.rs); it does perturb near-tied routing
+    /// decisions, so bit-faithful comparisons (tests/vs_cpu.rs) pin an f32 cache. Kcur/Vcur traces
+    /// need an f32 cache.
     pub kv_f16: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
         Options {
-            kv_f16: std::env::var_os("INKLING_KV_F16").is_some(),
+            kv_f16: std::env::var_os("INKLING_KV_F32").is_none(),
         }
     }
 }
@@ -577,7 +578,7 @@ impl MetalModel {
             a,
             max_ctx,
             max_batch: MAX_BATCH,
-            exact_prefill: std::env::var_os("INKLING_FAST_PREFILL").is_none(),
+            exact_prefill: std::env::var_os("INKLING_EXACT_PREFILL").is_some(),
             kv_f16: opts.kv_f16,
             pos: 0,
             trace_buf,
@@ -679,7 +680,7 @@ impl MetalModel {
                 Ok(())
             };
             this.a.tokens.write(&[token]);
-            this.encode(e, 1, &mut rec)
+            this.encode(e, 1, None, &mut rec)
         })?;
 
         self.last = stats;
@@ -708,10 +709,36 @@ impl MetalModel {
             this.a.tokens.write(chunk);
             self.last = this
                 .ctx
-                .run(|e| this.encode(e, chunk.len(), &mut |_, _, _, _, _, _| Ok(())))?;
+                .run(|e| this.encode(e, chunk.len(), None, &mut |_, _, _, _, _, _| Ok(())))?;
             self.pos += chunk.len();
         }
         Ok(self.a.logits.as_slice::<f32>()[..self.hp.n_vocab].to_vec())
+    }
+
+    /// Prefills `tokens` like `prefill`, but computes the logits of every position and calls
+    /// `f(position, logits)` for each, in order (quality measurement; the full output head runs
+    /// on every row).
+    pub fn prefill_each(&mut self, tokens: &[u32], mut f: impl FnMut(usize, &[f32])) -> Result<()> {
+        if self.pos + tokens.len() > self.max_ctx {
+            return Err(Error::Model(inkling::Error::ContextFull(
+                self.pos + tokens.len(),
+            )));
+        }
+        let nv = self.hp.n_vocab;
+        let out = self.ctx.buffer(self.max_batch * nv * 4)?;
+        for chunk in tokens.chunks(self.max_batch) {
+            let this = &*self;
+            this.a.tokens.write(chunk);
+            self.last = this
+                .ctx
+                .run(|e| this.encode(e, chunk.len(), Some(&out), &mut |_, _, _, _, _, _| Ok(())))?;
+            let lg = out.as_slice::<f32>();
+            for (i, _) in chunk.iter().enumerate() {
+                f(self.pos + i, &lg[i * nv..(i + 1) * nv]);
+            }
+            self.pos += chunk.len();
+        }
+        Ok(())
     }
 
     /// Runs one token with per-dispatch GPU timestamps and returns (kernel, total seconds, count),
@@ -726,7 +753,7 @@ impl MetalModel {
         let this = &*self;
         this.a.tokens.write(tokens);
         let per = this.ctx.profile(4096, |e| {
-            this.encode(e, tokens.len(), &mut |_, _, _, _, _, _| Ok(()))
+            this.encode(e, tokens.len(), None, &mut |_, _, _, _, _, _| Ok(()))
         })?;
         self.pos += tokens.len();
         let mut agg: std::collections::HashMap<String, (f64, usize)> =
@@ -1726,7 +1753,13 @@ impl MetalModel {
     }
 
     /// Encodes `nt` tokens (already in a.tokens) at positions pos..pos+nt; logits of the last one.
-    fn encode(&self, e: &mut Encoder, nt: usize, rec: &mut RecFn) -> Result<()> {
+    fn encode(
+        &self,
+        e: &mut Encoder,
+        nt: usize,
+        all_logits: Option<&Buffer>,
+        rec: &mut RecFn,
+    ) -> Result<()> {
         let hp = &self.hp;
         let a = &self.a;
         let d = hp.n_embd;
@@ -1803,6 +1836,61 @@ impl MetalModel {
             self.layer(e, il, il, &mut n_blocks, false, nt, rec)?;
         }
 
+        if let Some(out) = all_logits {
+            // every position's logits ([nt][n_vocab], for quality measurement)
+            self.mix(
+                e,
+                &a.blocks,
+                n_blocks,
+                &a.h,
+                self.output_res_query,
+                1,
+                &a.m,
+                nt,
+            )?;
+            self.norm(
+                e,
+                &a.m,
+                0,
+                Some(self.output_norm),
+                &a.n,
+                0,
+                d,
+                hp.rms_eps,
+                nt,
+            )?;
+            let mut args = MultiArgs {
+                cols: d as u32,
+                n_seg: 1,
+                total_rows: hp.n_vocab as u32,
+                n_tokens: nt as u32,
+                ..Default::default()
+            };
+            args.seg[0] = MultiSeg {
+                woff: self.output.0 as u64,
+                start: 0,
+                rows: hp.n_vocab as u32,
+            };
+            let mut binds = vec![buf(&self.w), buf(&a.n)];
+            binds.extend((0..8).map(|_| buf(out)));
+            binds.push(bytes(&args));
+            e.dispatch(
+                "gemm2_q8_0_multi_f32",
+                &binds,
+                (hp.n_vocab.div_ceil(GEMM_BM2), nt.div_ceil(GEMM_BN), 1),
+                (128, 1, 1),
+            )?;
+            if hp.final_softcap > 0.0 {
+                self.eltwise(
+                    e,
+                    "softcap_inplace",
+                    &[out],
+                    nt * hp.n_vocab,
+                    hp.final_softcap,
+                )?;
+            }
+            return Ok(());
+        }
         // only the last token's logits are needed: run the output head on that row
         let last = (nt - 1) * d;
         for b in 0..n_blocks {

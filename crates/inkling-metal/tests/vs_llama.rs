@@ -15,7 +15,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use inkling::Hparams;
-use inkling_metal::model::MetalModel;
+use inkling_metal::model::{MetalModel, Options};
 
 fn model_path() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("INKLING_MODEL") {
@@ -86,9 +86,16 @@ fn check(name: &str, greedy_steps: usize) {
         .collect();
     let g = gguf::Gguf::open(mp).unwrap();
     let hp = Hparams::from_gguf(&g).unwrap();
-    let mut m = MetalModel::new(&g, hp.clone(), tokens.len() + greedy_steps + 1).unwrap();
-    // INKLING_FAST_PREFILL set: measure the f16-tile path instead (for bisecting its accuracy)
-    m.exact_prefill = std::env::var_os("INKLING_FAST_PREFILL").is_none();
+    // single positions swing with near-tied routing flips, so these checks pin the exact settings
+    // (f32 cache, f32 tiles); tests/quality.rs measures the default precision over all positions
+    let mut m = MetalModel::with_options(
+        &g,
+        hp.clone(),
+        tokens.len() + greedy_steps + 1,
+        Options { kv_f16: false },
+    )
+    .unwrap();
+    m.exact_prefill = true;
     let t0 = std::time::Instant::now();
     let mut logits = m.prefill(&tokens).unwrap();
     println!(

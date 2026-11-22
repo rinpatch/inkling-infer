@@ -16,3 +16,10 @@ tools/llama-dump/llama-dump "$M" fixtures/prompts/long.txt  fixtures/out/long  3
 | short | 25 | chat template; every named tensor in all 48 slots; 64-token greedy continuation |
 | swa | 3810 | sliding window (1024) crossed several times |
 | long | 13571 | positions past 8192, where the log-scale τ goes above 1 |
+
+## Multi-position next-token reference (tests/quality.rs)
+
+```sh
+tools/llama-dump/llama-dump "$M" fixtures/prompts/swa.txt fixtures/out/swa_topk 1 '^$' 512 0 10 1
+```
+`topk.bin`: for each of the 3810 prompt positions, the full-vocabulary log-sum-exp plus llama.cpp's top-128 (id, logit). Quality gets reported as truncated KL over all positions (median / mean / p99 / max) plus top-1 agreement, because single positions swing with near-tied MoE routing decisions.

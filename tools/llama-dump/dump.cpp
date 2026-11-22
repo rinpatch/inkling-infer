@@ -7,6 +7,8 @@
 //   manifest.tsv              name \t ubatch \t ne0 \t ne1 \t ne2 \t ne3 \t file
 //   t/<name>.u<k>.f32         tensor data in logical (ne0-fastest) order
 //   logits_last.f32           unpadded logits of the last prompt token
+//   topk.bin                  (all_logits=1) per prompt position: f32 logsumexp over the full vocab,
+//                             then 128 x (u32 id, f32 logit), highest first
 //   greedy.tsv                step \t token \t piece \t top10 "id:logit" pairs (logits before choosing)
 
 #include "common.h"
@@ -15,6 +17,7 @@
 #include "ggml-backend.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -107,7 +110,7 @@ static std::vector<std::pair<int, float>> top_k(const float * logits, int n, int
 
 int main(int argc, char ** argv) {
     if (argc < 4) {
-        fprintf(stderr, "usage: %s <model.gguf> <prompt.txt> <out_dir> [n_gen=64] [filter=.] [ubatch=4096] [ngl=0] [threads=10]\n", argv[0]);
+        fprintf(stderr, "usage: %s <model.gguf> <prompt.txt> <out_dir> [n_gen=64] [filter=.] [ubatch=4096] [ngl=0] [threads=10] [all_logits=0]\n", argv[0]);
         return 1;
     }
     const std::string model_path = argv[1];
@@ -119,6 +122,7 @@ int main(int argc, char ** argv) {
     const int n_ub    = argc > 6 ? atoi(argv[6]) : 4096;
     const int ngl     = argc > 7 ? atoi(argv[7]) : 0;
     const int threads = argc > 8 ? atoi(argv[8]) : 10;
+    const bool all_logits = argc > 9 && atoi(argv[9]) != 0;
 
     std::ifstream pf(prompt_path);
     std::stringstream ss;
@@ -172,14 +176,38 @@ int main(int argc, char ** argv) {
 
     const int n_vocab = llama_vocab_n_tokens(vocab);
 
+    const int n_vocab_all = llama_vocab_n_tokens(vocab);
+
     // feed the prompt one ubatch at a time so each dumped tensor is tagged with its ubatch index
     for (int start = 0; start < n_tok; start += (int) cparams.n_ubatch) {
         const int n = std::min((int) cparams.n_ubatch, n_tok - start);
         st.seen.clear();
-        common_batch batch = common_batch_get_one(ctx, tokens.data() + start, n);
+        common_batch batch = all_logits ? common_batch(ctx) : common_batch_get_one(ctx, tokens.data() + start, n);
+        if (all_logits) {
+            for (int i = 0; i < n; ++i) batch.add(tokens[start + i], start + i, 0, true);
+        }
         if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
             fprintf(stderr, "prompt decode failed at %d\n", start);
             return 1;
+        }
+        if (all_logits) {
+            FILE * tf = fopen((st.out_dir + "/topk.bin").c_str(), start == 0 ? "wb" : "ab");
+            for (int i = 0; i < n; ++i) {
+                const float * lg = llama_get_logits_ith(ctx, i);
+                double m = -INFINITY;
+                for (int v = 0; v < n_vocab_all; ++v) m = std::max(m, (double) lg[v]);
+                double z = 0.0;
+                for (int v = 0; v < n_vocab_all; ++v) z += std::exp((double) lg[v] - m);
+                float lse = (float) (m + std::log(z));
+                fwrite(&lse, sizeof(float), 1, tf);
+                auto top = top_k(lg, n_vocab_all, 128);
+                for (auto & [id, val] : top) {
+                    uint32_t u = (uint32_t) id;
+                    fwrite(&u, sizeof(uint32_t), 1, tf);
+                    fwrite(&val, sizeof(float), 1, tf);
+                }
+            }
+            fclose(tf);
         }
         st.ubatch++;
     }

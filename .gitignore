@@ -4,3 +4,5 @@ fixtures/*.npy
 bench/results/raw/
 bench/engines/*/
 .venv/
+tools/llama-dump/llama-dump
+fixtures/out/

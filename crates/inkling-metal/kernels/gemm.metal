@@ -322,7 +322,8 @@ MOE_GEMM2_INSTANCES(block_iq4_nl, float, "iq4_nl_f32")
 MOE_GEMM2_INSTANCES(block_q8_0, float, "q8_0_f32")
 
 // ---- several Q8_0 matrices sharing one input, 64-row tiles ---------------------------------------
-// Same contract as gemm_q8_0_multi, with the 4x2-accumulator layout of the expert GEMMs.
+// out_s[t][r] = W_s[r] . x[t] for several Q8_0 matrices sharing one input (segment concatenation
+// as in mv_q8_0_multi), with the 4x2-accumulator layout of the expert GEMMs.
 // Grid: (ceil(total_rows/BM2), ceil(n_tokens/BN)), 128 threads.
 template <typename E>
 kernel void gemm2_q8_0_multi(device const uchar *W [[buffer(0)]], device const float *x [[buffer(1)]], device float *o0 [[buffer(2)]],

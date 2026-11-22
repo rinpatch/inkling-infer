@@ -550,7 +550,15 @@ impl MetalModel {
 
     /// Kernel name for the selected prefill tile precision.
     fn tile(&self, base: &str) -> String {
-        format!("{base}_{}", if self.exact_prefill { "f32" } else { "f16" })
+        // INKLING_FAST_PREFILL=moe|proj limits f16 tiles to one GEMM family (any other value: all)
+        let fam = std::env::var("INKLING_FAST_PREFILL").unwrap_or_default();
+        let f16 = !self.exact_prefill
+            && match fam.as_str() {
+                "moe" => base.starts_with("moe_"),
+                "proj" => base.starts_with("gemm2_q8_0"),
+                _ => true,
+            };
+        format!("{base}_{}", if f16 { "f16" } else { "f32" })
     }
 
     pub fn pos(&self) -> usize {

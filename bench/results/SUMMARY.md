@@ -45,3 +45,15 @@ Setup notes: RunBench's generic loader tries the VLM factory first, which can't 
 | ours `082f75c` | IQ4_NL GGUF | ~325 (pp512) | 40.4 (@0) | ~315 (pp4096) | 34.2 (@4096) |
 
 The MLX runner ignores `cache_prompt: false` and reuses a shared prompt prefix, so the script puts a random tag at the start of every prompt. Without it, prefill measures 9k–84k tok/s. Its decode is flat with context (about 21 tok/s), and BF16 attention weights make it read about 1.2 GB more per token than the Q8_0 attention in the GGUF (16 vs 8.5 bits).
+
+### Official tag `inkling-2-mini:26b-a5b-nvfp4` (with the DSpark drafter), default server settings
+
+`ollama create` from the HF snapshot drops `mtp.safetensors`, so the rows above ran without speculative decoding. The official tag (20.2 GB) carries the drafter as `draft.*` tensors, and the runner logs `Loaded draft model ... Inkling2ForConditionalGenerationMTP`.
+
+| engine | pp (524 tok) | decode @524 | pp (4567 tok) | decode @4567 |
+|---|---|---|---|---|
+| Ollama official, drafting | 291.7 | 29.4 | 304.2 | 36.8 |
+| Ollama import, no drafter | 292.0 | 20.9 | 303.7 | 21.0 |
+| ours `082f75c`, no drafting | ~325 | 40.4 (@0) | ~315 | 34.2 (@4096) |
+
+Runner stats on this greedy text: 50–65% of drafted tokens accepted, 1.6–3.9 tokens committed per verification step, up to 7 drafted. Gains depend on the text: more predictable continuations accept more drafts.

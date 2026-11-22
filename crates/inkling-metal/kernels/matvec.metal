@@ -353,3 +353,4 @@ kernel void bw_blocks18(device const block_iq4_nl *src [[buffer(0)]], device uin
     }
     out[gid] = acc;
 }
+

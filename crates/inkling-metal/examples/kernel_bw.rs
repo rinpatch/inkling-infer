@@ -236,6 +236,24 @@ fn main() -> anyhow::Result<()> {
         tq,
     );
 
+    // the same kernel on one large tensor: dispatch ramp-up and drain amortized away
+    let lm = g.tensor("output.weight")?;
+    let (rows, cols) = (lm.dims[1], lm.dims[0]);
+    let ylm = ctx.buffer(rows * 4)?;
+    let t = best(&mut || {
+        Ok(ctx
+            .run(|e| {
+                e.dispatch(
+                    "mv_q8_0",
+                    &[buf_at(&w, lm.offset), buf(&x), buf(&ylm), bytes(&MvArgs { rows: rows as u32, cols: cols as u32 })],
+                    (rows.div_ceil(MV_SG), 1, 1),
+                    (32 * MV_SG, 1, 1),
+                )
+            })?
+            .gpu_s)
+    })?;
+    report("mv_q8_0, lm_head (one dispatch)", lm.nbytes, t);
+
     // 3. a real decode step for comparison
     let mut m = MetalModel::new(&g, hp.clone(), 256)?;
     for i in 0..64u32 {

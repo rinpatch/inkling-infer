@@ -93,29 +93,67 @@ impl SafeTensors {
                 return Err(Error::Truncated(0));
             }
             let n = u64::from_le_bytes(map[..8].try_into().expect("8 bytes")) as usize;
-            let header: serde_json::Value = serde_json::from_slice(map.get(8..8 + n).ok_or(Error::Truncated(8))?)
-                .map_err(|e| Error::Header(format!("{}: {e}", path.display())))?;
+            let header: serde_json::Value =
+                serde_json::from_slice(map.get(8..8 + n).ok_or(Error::Truncated(8))?)
+                    .map_err(|e| Error::Header(format!("{}: {e}", path.display())))?;
             let base = 8 + n;
-            for (name, info) in header.as_object().ok_or_else(|| Error::Header("header is not an object".into()))? {
+            for (name, info) in header
+                .as_object()
+                .ok_or_else(|| Error::Header("header is not an object".into()))?
+            {
                 if name == "__metadata__" {
                     continue;
                 }
-                let dtype = info["dtype"].as_str().and_then(StDType::parse).ok_or_else(|| Error::Header(format!("{name}: unsupported dtype {}", info["dtype"])))?;
-                let shape: Vec<usize> = info["shape"].as_array().ok_or_else(|| Error::Header(format!("{name}: shape")))?.iter().map(|v| v.as_u64().unwrap_or(0) as usize).collect();
-                let off = info["data_offsets"].as_array().ok_or_else(|| Error::Header(format!("{name}: offsets")))?;
-                let (a, b) = (off[0].as_u64().unwrap_or(0) as usize, off[1].as_u64().unwrap_or(0) as usize);
-                if base + b > map.len() || b < a || shape.iter().product::<usize>() * dtype.size() != b - a {
+                let dtype = info["dtype"]
+                    .as_str()
+                    .and_then(StDType::parse)
+                    .ok_or_else(|| {
+                        Error::Header(format!("{name}: unsupported dtype {}", info["dtype"]))
+                    })?;
+                let shape: Vec<usize> = info["shape"]
+                    .as_array()
+                    .ok_or_else(|| Error::Header(format!("{name}: shape")))?
+                    .iter()
+                    .map(|v| v.as_u64().unwrap_or(0) as usize)
+                    .collect();
+                let off = info["data_offsets"]
+                    .as_array()
+                    .ok_or_else(|| Error::Header(format!("{name}: offsets")))?;
+                let (a, b) = (
+                    off[0].as_u64().unwrap_or(0) as usize,
+                    off[1].as_u64().unwrap_or(0) as usize,
+                );
+                if base + b > map.len()
+                    || b < a
+                    || shape.iter().product::<usize>() * dtype.size() != b - a
+                {
                     return Err(Error::TensorBounds(name.clone()));
                 }
-                tensors.insert(name.clone(), StTensor { name: name.clone(), dtype, shape, shard: si, offset: base + a, nbytes: b - a });
+                tensors.insert(
+                    name.clone(),
+                    StTensor {
+                        name: name.clone(),
+                        dtype,
+                        shape,
+                        shard: si,
+                        offset: base + a,
+                        nbytes: b - a,
+                    },
+                );
             }
             shards.push(map);
         }
-        Ok(SafeTensors { dir, shards, tensors })
+        Ok(SafeTensors {
+            dir,
+            shards,
+            tensors,
+        })
     }
 
     pub fn get(&self, name: &str) -> Result<&StTensor> {
-        self.tensors.get(name).ok_or_else(|| Error::MissingTensor(name.to_string()))
+        self.tensors
+            .get(name)
+            .ok_or_else(|| Error::MissingTensor(name.to_string()))
     }
 
     pub fn has(&self, name: &str) -> bool {
@@ -139,10 +177,24 @@ impl SafeTensors {
     pub fn to_f32(&self, t: &StTensor) -> Result<Vec<f32>> {
         let b = self.bytes(t);
         Ok(match t.dtype {
-            StDType::F32 => b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
-            StDType::F16 => b.chunks_exact(2).map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32()).collect(),
-            StDType::Bf16 => b.chunks_exact(2).map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32()).collect(),
-            other => return Err(Error::Header(format!("{}: {other:?} is not a float tensor", t.name))),
+            StDType::F32 => b
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect(),
+            StDType::F16 => b
+                .chunks_exact(2)
+                .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
+                .collect(),
+            StDType::Bf16 => b
+                .chunks_exact(2)
+                .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
+                .collect(),
+            other => {
+                return Err(Error::Header(format!(
+                    "{}: {other:?} is not a float tensor",
+                    t.name
+                )));
+            }
         })
     }
 
@@ -158,13 +210,20 @@ mod tests {
     fn snapshot(repo: &str) -> Option<PathBuf> {
         let home = PathBuf::from(std::env::var_os("HOME")?);
         let snaps = home.join(format!(".cache/huggingface/hub/models--{repo}/snapshots"));
-        std::fs::read_dir(snaps).ok()?.flatten().map(|e| e.path()).next()
+        std::fs::read_dir(snaps)
+            .ok()?
+            .flatten()
+            .map(|e| e.path())
+            .next()
     }
 
     /// Every header in the native and JANGH2 bundles parses and every tensor fits its shard.
     #[test]
     fn opens_downloaded_bundles() {
-        for repo in ["thinkingmachines--Inkling-2-Mini", "OsaurusAI--Inkling-2-Mini-JANGH2"] {
+        for repo in [
+            "thinkingmachines--Inkling-2-Mini",
+            "OsaurusAI--Inkling-2-Mini-JANGH2",
+        ] {
             let Some(dir) = snapshot(repo) else {
                 eprintln!("SKIP: {repo} not downloaded");
                 continue;
@@ -174,9 +233,14 @@ mod tests {
             assert!(n > 1000, "{repo}: only {n} tensors");
             let mut by_dtype = std::collections::BTreeMap::new();
             for name in st.names() {
-                *by_dtype.entry(format!("{:?}", st.get(name).unwrap().dtype)).or_insert(0usize) += 1;
+                *by_dtype
+                    .entry(format!("{:?}", st.get(name).unwrap().dtype))
+                    .or_insert(0usize) += 1;
             }
-            println!("{repo}: {n} tensors in {} shards, {by_dtype:?}", st.n_shards());
+            println!(
+                "{repo}: {n} tensors in {} shards, {by_dtype:?}",
+                st.n_shards()
+            );
         }
     }
 }

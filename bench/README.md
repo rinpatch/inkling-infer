@@ -14,7 +14,6 @@ Machine: Mac with M4 Pro (10P + 4E CPU, 20-core GPU, 48 GB, ~273 GB/s), macOS 27
 | llama.cpp `c66103334` | IQ4_NL GGUF (ggml-org) | `bench/run_llama.sh` |
 | mlx-vlm (Neywa-Labs fork) | `VisualInference/Inkling-2-Mini-MLX-4bit` | published M4 Pro numbers: tg 31.1 / 27.6 / 26.5 at 28 / 1K / 4K prompt |
 | inkling2-mini-mlx-fast `3558b31` | official NVFP4/MXFP8 checkpoint | `bench/engines/inkling2-mini-mlx-fast` |
-| razorback16/inkling-infer `87d0e22` | official checkpoint | `bench/engines/razorback-inkling-infer` |
 | realugbun llama.cpp inkling2-speed fork | IQ4_NL GGUF | to try |
 | ours | IQ4_NL GGUF | `inkling bench` (Phase 5) |
 

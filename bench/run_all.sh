@@ -1,5 +1,5 @@
 #!/bin/sh
-# Head-to-head on a quiet machine: ours, llama.cpp, mlx-vlm, razorback/inkling-infer.
+# Head-to-head on a quiet machine: ours, llama.cpp, mlx-vlm.
 # Tests: pp512, tg128 at empty context, pp4096, tg128 after 4096 tokens of context.
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
@@ -25,8 +25,3 @@ B=$LLAMA/build/bin/llama-bench
 echo "== mlx-vlm (VisualInference 4-bit)"
 "$here/engines/mlx-vlm-venv/bin/python" -I "$here/mlx_vlm_bench.py" VisualInference/Inkling-2-Mini-MLX-4bit \
   "$repo/fixtures/prompts/long.txt" "$R/mlx-vlm-4bit.json"
-
-echo "== razorback inkling-infer (official checkpoint, custom kernels)"
-RB=$here/engines/razorback-inkling-infer
-(cd "$RB" && .venv/bin/python decode_benchmark.py --kernel | tee "$R/razorback-decode-d4096.txt")
-(cd "$RB" && .venv/bin/python prefill_benchmark.py | tee "$R/razorback-pp4096.txt")

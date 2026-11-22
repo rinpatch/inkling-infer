@@ -1,0 +1,123 @@
+== ours (9c30f6b)
+  last token: 1626 dispatches, encode 0.30 ms, GPU 26.23 ms
+  last token: 1626 dispatches, encode 0.30 ms, GPU 26.30 ms
+  last token: 1626 dispatches, encode 0.32 ms, GPU 26.24 ms
+  last token: 1626 dispatches, encode 0.32 ms, GPU 25.69 ms
+  last token: 1626 dispatches, encode 0.35 ms, GPU 25.04 ms
+metal  pp512     280.37 ± 2.68 tok/s
+metal  tg128 @ depth 0        38.61 ± 0.17 tok/s  (57% of the ~68 tok/s roofline)
+  last token: 1626 dispatches, encode 0.30 ms, GPU 49.25 ms
+  last token: 1626 dispatches, encode 0.74 ms, GPU 50.86 ms
+  last token: 1626 dispatches, encode 0.33 ms, GPU 48.67 ms
+metal  pp4096    191.06 ± 21.25 tok/s
+metal  tg128 @ depth 4096     19.96 ± 0.20 tok/s  (29% of the ~68 tok/s roofline)
+== llama.cpp (f7b65a6b5)
+ggml_metal_device_init: tensor API disabled for pre-M5 and pre-A19 devices
+ggml_metal_library_init: using embedded metal library
+ggml_metal_library_compile_all: compiled 'fa_aux' library in 0.004 sec
+ggml_metal_library_compile_all: compiled 'fa_f16' library in 0.015 sec
+ggml_metal_library_compile_all: compiled 'fa_f32' library in 0.005 sec
+ggml_metal_library_compile_all: compiled 'fa_q4_0' library in 0.007 sec
+ggml_metal_library_compile_all: compiled 'fa_q4_1' library in 0.008 sec
+ggml_metal_library_compile_all: compiled 'fa_q5_0' library in 0.038 sec
+ggml_metal_library_compile_all: compiled 'fa_q5_1' library in 0.024 sec
+ggml_metal_library_compile_all: compiled 'fa_q8_0' library in 0.043 sec
+ggml_metal_library_compile_all: compiled 'fa_tensor' library in 0.004 sec
+ggml_metal_library_compile_all: compiled 'fa_vec_f16' library in 0.019 sec
+ggml_metal_library_compile_all: compiled 'fa_vec_f32' library in 0.009 sec
+ggml_metal_library_compile_all: compiled 'fa_vec_q4_0' library in 0.034 sec
+ggml_metal_library_compile_all: compiled 'fa_vec_q4_1' library in 0.041 sec
+ggml_metal_library_compile_all: compiled 'fa_vec_q5_0' library in 0.046 sec
+ggml_metal_library_compile_all: compiled 'fa_vec_q5_1' library in 0.027 sec
+ggml_metal_library_compile_all: compiled 'fa_vec_q8_0' library in 0.037 sec
+ggml_metal_library_compile_all: compiled 'mul_mv' library in 0.022 sec
+ggml_metal_library_compile_all: compiled 'mul_mv_mma' library in 0.013 sec
+ggml_metal_library_compile_all: compiled 'mul_mm' library in 0.031 sec
+ggml_metal_library_compile_all: compiled 'quantize' library in 0.023 sec
+ggml_metal_library_compile_all: compiled 'softmax' library in 0.003 sec
+ggml_metal_library_compile_all: compiled 'norm' library in 0.034 sec
+ggml_metal_library_compile_all: compiled 'unary' library in 0.005 sec
+ggml_metal_library_compile_all: compiled 'binbcast' library in 0.028 sec
+ggml_metal_library_compile_all: compiled 'reduce' library in 0.003 sec
+ggml_metal_library_compile_all: compiled 'tri' library in 0.027 sec
+ggml_metal_library_compile_all: compiled 'ssm' library in 0.005 sec
+ggml_metal_library_compile_all: compiled 'wkv' library in 0.027 sec
+ggml_metal_library_compile_all: compiled 'gated_delta_net' library in 0.024 sec
+ggml_metal_library_compile_all: compiled 'solve_tri' library in 0.004 sec
+ggml_metal_library_compile_all: compiled 'rope' library in 0.027 sec
+ggml_metal_library_compile_all: compiled 'conv' library in 0.011 sec
+ggml_metal_library_compile_all: compiled 'upscale' library in 0.010 sec
+ggml_metal_library_compile_all: compiled 'argsort' library in 0.009 sec
+ggml_metal_library_compile_all: compiled 'pool' library in 0.007 sec
+ggml_metal_library_compile_all: compiled 'misc' library in 0.006 sec
+ggml_metal_library_compile_all: loaded 36 libraries from embedded data in 0.046 sec (max single = 0.046 sec)
+ggml_metal_rsets_init: creating a residency set collection (keep_alive = 180 s)
+ggml_metal_device_init: GPU name:   MTL0 (Apple M4 Pro)
+ggml_metal_device_init: GPU family: MTLGPUFamilyApple9  (1009)
+ggml_metal_device_init: GPU family: MTLGPUFamilyMetal4  (5002)
+ggml_metal_device_init: simdgroup reduction   = true
+ggml_metal_device_init: simdgroup matrix mul. = true
+ggml_metal_device_init: has unified memory    = true
+ggml_metal_device_init: has bfloat            = true
+ggml_metal_device_init: has tensor            = false
+ggml_metal_device_init: use residency sets    = true
+ggml_metal_device_init: use shared buffers    = true
+ggml_metal_device_init: recommendedMaxWorkingSetSize  = 40200.90 MB
+ggml_metal_device_init: tensor API disabled for pre-M5 and pre-A19 devices
+ggml_metal_library_init: using embedded metal library
+ggml_metal_library_compile_all: compiled 'fa_aux' library in 0.001 sec
+ggml_metal_library_compile_all: compiled 'fa_f16' library in 0.001 sec
+ggml_metal_library_compile_all: compiled 'fa_f32' library in 0.005 sec
+ggml_metal_library_compile_all: compiled 'fa_q4_0' library in 0.002 sec
+ggml_metal_library_compile_all: compiled 'fa_q4_1' library in 0.002 sec
+ggml_metal_library_compile_all: compiled 'fa_q5_0' library in 0.002 sec
+ggml_metal_library_compile_all: compiled 'fa_q5_1' library in 0.007 sec
+ggml_metal_library_compile_all: compiled 'fa_q8_0' library in 0.007 sec
+ggml_metal_library_compile_all: compiled 'fa_tensor' library in 0.005 sec
+ggml_metal_library_compile_all: compiled 'fa_vec_f16' library in 0.003 sec
+ggml_metal_library_compile_all: compiled 'fa_vec_f32' library in 0.004 sec
+ggml_metal_library_compile_all: compiled 'fa_vec_q4_0' library in 0.010 sec
+ggml_metal_library_compile_all: compiled 'fa_vec_q4_1' library in 0.009 sec
+ggml_metal_library_compile_all: compiled 'fa_vec_q5_0' library in 0.011 sec
+ggml_metal_library_compile_all: compiled 'fa_vec_q5_1' library in 0.013 sec
+ggml_metal_library_compile_all: compiled 'fa_vec_q8_0' library in 0.014 sec
+ggml_metal_library_compile_all: compiled 'mul_mv' library in 0.004 sec
+ggml_metal_library_compile_all: compiled 'mul_mv_mma' library in 0.012 sec
+ggml_metal_library_compile_all: compiled 'mul_mm' library in 0.006 sec
+ggml_metal_library_compile_all: compiled 'quantize' library in 0.007 sec
+ggml_metal_library_compile_all: compiled 'softmax' library in 0.007 sec
+ggml_metal_library_compile_all: compiled 'norm' library in 0.007 sec
+ggml_metal_library_compile_all: compiled 'unary' library in 0.010 sec
+ggml_metal_library_compile_all: compiled 'binbcast' library in 0.007 sec
+ggml_metal_library_compile_all: compiled 'reduce' library in 0.009 sec
+ggml_metal_library_compile_all: compiled 'tri' library in 0.009 sec
+ggml_metal_library_compile_all: compiled 'ssm' library in 0.005 sec
+ggml_metal_library_compile_all: compiled 'wkv' library in 0.005 sec
+ggml_metal_library_compile_all: compiled 'gated_delta_net' library in 0.005 sec
+ggml_metal_library_compile_all: compiled 'solve_tri' library in 0.007 sec
+ggml_metal_library_compile_all: compiled 'rope' library in 0.005 sec
+ggml_metal_library_compile_all: compiled 'conv' library in 0.004 sec
+ggml_metal_library_compile_all: compiled 'upscale' library in 0.004 sec
+ggml_metal_library_compile_all: compiled 'argsort' library in 0.005 sec
+ggml_metal_library_compile_all: compiled 'pool' library in 0.005 sec
+ggml_metal_library_compile_all: compiled 'misc' library in 0.004 sec
+ggml_metal_library_compile_all: loaded 36 libraries from embedded data in 0.015 sec (max single = 0.014 sec)
+ggml_metal_rsets_init: creating a residency set collection (keep_alive = 180 s)
+ggml_metal_device_init: GPU name:   MTL0 (Apple M4 Pro)
+ggml_metal_device_init: GPU family: MTLGPUFamilyApple9  (1009)
+ggml_metal_device_init: GPU family: MTLGPUFamilyMetal4  (5002)
+ggml_metal_device_init: simdgroup reduction   = true
+ggml_metal_device_init: simdgroup matrix mul. = true
+ggml_metal_device_init: has unified memory    = true
+ggml_metal_device_init: has bfloat            = true
+ggml_metal_device_init: has tensor            = false
+ggml_metal_device_init: use residency sets    = true
+ggml_metal_device_init: use shared buffers    = true
+ggml_metal_device_init: recommendedMaxWorkingSetSize  = 40200.90 MB
+== mlx-vlm (VisualInference 4-bit)
+Fetching 28 files:   0%|          | 0/28 [00:00<?, ?it/s]Fetching 28 files: 100%|██████████| 28/28 [00:00<00:00, 2674.09it/s]
+{"engine": "mlx-vlm", "prompt_tokens": 512, "pp_tps": 411.81842465963877, "tg128_tps": 29.53712242511481, "pp_samples": [405.6793257793959, 413.87632213430265, 411.81842465963877], "tg_samples": [29.53712242511481, 29.353477898612546, 29.565122741272646], "peak_gb": 17.481254152}
+{"engine": "mlx-vlm", "prompt_tokens": 4096, "pp_tps": 352.6778089674546, "tg128_tps": 25.544446576204127, "pp_samples": [357.79762720794827, 349.1393273938739, 352.6778089674546], "tg_samples": [25.423415732205168, 25.544446576204127, 25.761303971617792], "peak_gb": 23.783594656}
+== razorback inkling-infer (official checkpoint, custom kernels)
+bench/run_all.sh: line 31: .venv/bin/python: No such file or directory
+bench/run_all.sh: line 32: .venv/bin/python: No such file or directory

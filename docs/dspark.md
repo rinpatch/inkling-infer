@@ -59,6 +59,17 @@ Committed length P; the anchor is the token at position P (sampled, not yet in t
    - The 7-step walk. One dispatch chain per step: rnn_proj matvec, gate math, W_fold matvec, add base, softcap, argmax. It stays on the GPU end to end.
 5. Round loop on the GPU, without CPU round trips. Acceptance (compare argmaxes) and the bonus token can be a tiny kernel. The CPU only reads back the accepted count to advance pos. Pipelining across rounds is harder, because the next round's positions depend on n.
 
+## Measured: acceptance on the GGUF model (examples/dspark_accept.rs)
+
+The f32 CPU drafter fed with our IQ4_NL model's features and checked against its greedy tokens:
+
+| prompt | prompt tokens | generated | accepted drafts / round | tokens / round |
+|---|---|---|---|---|
+| fixtures/prompts/long.txt | 512 | 129 | 1.74 | 2.74 |
+| fixtures/prompts/swa.txt (markdown + base64 blob) | 1500 | 195 | 1.83 | 2.83 |
+
+Ollama with the original NVFP4 weights logged 1.56–1.67 accepted per round in three of four runs (2.37 in one) on the same kind of prompt. So the GGUF's different hidden states cost no measurable acceptance, and distillation is not needed. With ~2.8 tokens per round, the gain is 2.8 / (verify cost + draft cost) in decode-step units.
+
 ## Risks and checks before building all of it
 
 - **Acceptance with GGUF features.** The drafter was trained on the original model's hidden states and tokens. Our IQ4_NL features differ by a few % at deep layers, and our greedy tokens differ where the two models disagree. Estimate: per-token acceptance about 0.75 → 0.70, so about 15% less speedup than with the original weights.

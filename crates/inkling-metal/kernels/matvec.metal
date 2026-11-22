@@ -354,3 +354,65 @@ kernel void bw_blocks18(device const block_iq4_nl *src [[buffer(0)]], device uin
     out[gid] = acc;
 }
 
+
+// Repack probe for examples/kernel_bw.rs: moe_gate_up / moe_down over IQ4_NL split into an aligned
+// value array (16 bytes per block, read as one uint2 per half-block) and a separate scale array.
+// Same work split as the kernels above; only the loads differ.
+inline float half_dot_soa(uint2 qv, half d, thread const XHalf &x, threadgroup const float *tab) {
+    uchar4 a = as_type<uchar4>(qv.x), c = as_type<uchar4>(qv.y);
+    float s = dot(float4(tab[a.x & 15], tab[a.y & 15], tab[a.z & 15], tab[a.w & 15]), x.v[0]) +
+              dot(float4(tab[c.x & 15], tab[c.y & 15], tab[c.z & 15], tab[c.w & 15]), x.v[1]) +
+              dot(float4(tab[a.x >> 4], tab[a.y >> 4], tab[a.z >> 4], tab[a.w >> 4]), x.v[2]) +
+              dot(float4(tab[c.x >> 4], tab[c.y >> 4], tab[c.z >> 4], tab[c.w >> 4]), x.v[3]);
+    return float(d) * s;
+}
+
+kernel void moe_gate_up_iq4_soa(device const uint2 *Q [[buffer(0)]], device const half *D [[buffer(1)]], device const float *x [[buffer(2)]],
+                                device const uint *ids [[buffer(3)]], device float *act [[buffer(4)]], constant MoeArgs &a [[buffer(5)]],
+                                uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                                uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float tab[16];
+    load_table(tab, tid);
+    uint i0 = (tg.x * MV_SG + sg) * MOE_NR;
+    uint k = tg.y;
+    if (i0 >= a.n_ff) return;
+    uint nb = a.n_embd / QK;
+    ulong e0 = (ulong)ids[k] * 2 * a.n_ff * nb;
+    float g[MOE_NR] = {0}, u[MOE_NR] = {0};
+    for (uint t = lane; t < 2 * nb; t += 32) {
+        uint b = t / 2, h = t % 2;
+        XHalf xs = load_x_half(block_iq4_nl{}, x + b * QK, h);
+        for (uint r = 0; r < MOE_NR; ++r) {
+            ulong bg = e0 + (ulong)(i0 + r) * nb + b, bu = e0 + (ulong)(a.n_ff + i0 + r) * nb + b;
+            g[r] += half_dot_soa(Q[bg * 2 + h], D[bg], xs, tab);
+            u[r] += half_dot_soa(Q[bu * 2 + h], D[bu], xs, tab);
+        }
+    }
+    for (uint r = 0; r < MOE_NR; ++r) {
+        float gs = simd_sum(g[r]), us = simd_sum(u[r]);
+        if (lane == 0 && i0 + r < a.n_ff) act[k * a.n_ff + i0 + r] = softcapf(gs, a.situ_beta) * sigmoidf(gs) * softcapf(us, a.situ_lin);
+    }
+}
+
+kernel void moe_down_iq4_soa(device const uint2 *Q [[buffer(0)]], device const half *D [[buffer(1)]], device const float *act [[buffer(2)]],
+                             device const uint *ids [[buffer(3)]], device const float *wts [[buffer(4)]], device float *y [[buffer(5)]],
+                             constant MoeArgs &a [[buffer(6)]], uint tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                             uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float tab[16];
+    load_table(tab, tid);
+    uint r0 = (tg * MV_SG + sg) * MOE_NR;
+    if (r0 >= a.n_embd) return;
+    uint nb = a.n_ff / QK;
+    float acc[MOE_NR] = {0};
+    for (uint t = lane; t < a.n_used * nb * 2; t += 32) {
+        uint k = t / (2 * nb), b = (t / 2) % nb, h = t % 2;
+        XHalf xs = load_x_half(block_iq4_nl{}, act + k * a.n_ff + b * QK, h);
+        ulong base = ((ulong)ids[k] * a.n_embd + r0) * nb + b;
+        float wk = wts[k];
+        for (uint r = 0; r < MOE_NR; ++r) acc[r] += wk * half_dot_soa(Q[(base + (ulong)r * nb) * 2 + h], D[base + (ulong)r * nb], xs, tab);
+    }
+    for (uint r = 0; r < MOE_NR; ++r) {
+        float v = simd_sum(acc[r]);
+        if (lane == 0 && r0 + r < a.n_embd) y[r0 + r] = v;
+    }
+}

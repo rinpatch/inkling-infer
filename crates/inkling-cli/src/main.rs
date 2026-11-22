@@ -113,6 +113,20 @@ impl<'g> Engine<'g> {
         }
     }
 
+    /// Processes a prompt: batched on Metal, token by token on the CPU reference.
+    fn prefill(&mut self, tokens: &[u32]) -> Result<Vec<f32>> {
+        match self {
+            Engine::Metal(m) => Ok(m.prefill(tokens)?),
+            Engine::Cpu(_) => {
+                let mut logits = Vec::new();
+                for &t in tokens {
+                    logits = self.step(t)?;
+                }
+                Ok(logits)
+            }
+        }
+    }
+
     fn step(&mut self, token: u32) -> Result<Vec<f32>> {
         Ok(match self {
             Engine::Cpu(b) => {
@@ -177,10 +191,7 @@ fn run(args: &Args, g: &gguf::Gguf, hp: &Hparams) -> Result<()> {
     let mut eng = Engine::new(args.backend, g, hp, ids.len() + args.n_gen + 1)?;
 
     let t0 = Instant::now();
-    let mut logits = Vec::new();
-    for &t in &ids {
-        logits = eng.step(t)?;
-    }
+    let mut logits = eng.prefill(&ids)?;
     let t_prompt = t0.elapsed().as_secs_f64();
 
     let mut rng = Rng(args.seed.wrapping_mul(0x9E3779B97F4A7C15) | 1);
@@ -245,9 +256,7 @@ fn bench(args: &Args, g: &gguf::Gguf, hp: &Hparams) -> Result<()> {
         if args.pp > 0 {
             eng.reset(hp);
             let t = Instant::now();
-            for &tk in &tokens[..args.pp] {
-                eng.step(tk)?;
-            }
+            eng.prefill(&tokens[..args.pp])?;
             if rep > 0 {
                 pp.push(args.pp as f64 / t.elapsed().as_secs_f64());
             }
@@ -294,19 +303,18 @@ fn bench(args: &Args, g: &gguf::Gguf, hp: &Hparams) -> Result<()> {
         for &t in &tokens[..64] {
             m.step(t, &mut NoTrace)?;
         }
-        let prof = m.profile_step(tokens[64])?;
+        // INKLING_PROFILE=N profiles a batch of N tokens (1 = decode)
+        let batch = std::env::var("INKLING_PROFILE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(1)
+            .clamp(1, 256);
+        let prof = m.profile_batch(&tokens[64..64 + batch])?;
         let total: f64 = prof.iter().map(|p| p.1).sum();
-        println!(
-            "per-kernel GPU time for one token at position 64 (separate encoders; sum {:.2} ms):",
-            total * 1e3
-        );
+        // timestamps come from separate per-dispatch encoders, so only the shares are meaningful
+        println!("per-kernel GPU share for {batch} token(s) at position 64:");
         for (k, t, n) in &prof {
-            println!(
-                "  {k:24} {:7.3} ms  {:5.1}%  x{n:<5} {:6.2} us/dispatch",
-                t * 1e3,
-                100.0 * t / total,
-                t * 1e6 / *n as f64
-            );
+            println!("  {k:28} {:5.1}%  x{n}", 100.0 * t / total);
         }
     }
     if let Some(path) = &args.json {

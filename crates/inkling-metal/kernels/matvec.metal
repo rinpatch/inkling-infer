@@ -19,11 +19,14 @@ kernel void mv_q8_0(device const block_q8_0 *W [[buffer(0)]], device const float
     if (lane == 0) y[r] = s;
 }
 
+// Batched over tokens on grid y: y[t] = W x[t]. Weights are small (router) and stay in cache.
 kernel void mv_f32(device const float *W [[buffer(0)]], device const float *x [[buffer(1)]], device float *y [[buffer(2)]],
-                   constant MvArgs &a [[buffer(3)]], uint tg [[threadgroup_position_in_grid]],
+                   constant MvArgs &a [[buffer(3)]], uint2 tg [[threadgroup_position_in_grid]],
                    uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
-    uint r = tg * MV_SG + sg;
+    uint r = tg.x * MV_SG + sg;
     if (r >= a.rows) return;
+    x += (ulong)tg.y * a.cols;
+    y += (ulong)tg.y * a.rows;
     device const float *w = W + (ulong)r * a.cols;
     float acc = 0.0f;
     for (uint i = lane; i < a.cols; i += 32) acc += w[i] * x[i];
@@ -184,9 +187,12 @@ struct TopkArgs {
 // Router selection: probs = sigmoid(logits); pick top-k of probs + bias; weights = scale * p / sum(p).
 // One threadgroup of n_expert threads (<= 1024): k rounds of a threadgroup argmax (ties -> lowest id).
 kernel void moe_topk(device const float *logits [[buffer(0)]], device const float *bias [[buffer(1)]], device uint *ids [[buffer(2)]],
-                     device float *wts [[buffer(3)]], constant TopkArgs &a [[buffer(4)]], uint tid [[thread_position_in_threadgroup]],
-                     uint ntg [[threads_per_threadgroup]]) {
+                     device float *wts [[buffer(3)]], constant TopkArgs &a [[buffer(4)]], uint t [[threadgroup_position_in_grid]],
+                     uint tid [[thread_position_in_threadgroup]], uint ntg [[threads_per_threadgroup]]) {
     threadgroup float scratch[32];
+    logits += (ulong)t * a.n_expert;
+    ids += t * a.k;
+    wts += t * a.k;
     threadgroup uint chosen[16];
     float p = tid < a.n_expert ? sigmoidf(logits[tid]) : 0.0f;
     float score = tid < a.n_expert ? p + bias[tid] : -INFINITY;
@@ -223,10 +229,16 @@ struct GateArgs {
 
 // z[r] = D[r] . [rms(x); rms(m)]. One threadgroup per rank row; each recomputes the two norms
 // (2*d floats, served from cache) instead of a separate dispatch.
+// Grid: (rank, n_tokens), 1024 threads.
 kernel void msg_gate_down(device const float *D [[buffer(0)]], device const float *x [[buffer(1)]], device const float *m [[buffer(2)]],
-                          device float *z [[buffer(3)]], constant GateArgs &a [[buffer(4)]], uint r [[threadgroup_position_in_grid]],
-                          uint tid [[thread_position_in_threadgroup]], uint ntg [[threads_per_threadgroup]]) {
+                          device float *z [[buffer(3)]], constant GateArgs &a [[buffer(4)]], uint2 tg [[threadgroup_position_in_grid]],
+                          uint tid [[thread_index_in_threadgroup]]) {
     threadgroup float scratch[32];
+    const uint ntg = 1024;
+    uint r = tg.x;
+    x += (ulong)tg.y * a.d;
+    m += (ulong)tg.y * a.d;
+    z += (ulong)tg.y * a.rank;
     float sx = 0.0f, sm = 0.0f, dx = 0.0f, dm = 0.0f;
     device const float *row = D + (ulong)r * 2 * a.d;
     for (uint i = tid; i < a.d; i += ntg) {
@@ -244,12 +256,17 @@ kernel void msg_gate_down(device const float *D [[buffer(0)]], device const floa
 }
 
 // One simdgroup per channel c; out may alias x (each channel reads and writes only its own c).
+// Grid: (ceil(d / MV_SG), n_tokens).
 kernel void msg_gate_up(device const float *F [[buffer(0)]], device const float *G [[buffer(1)]], device const float *z [[buffer(2)]],
                         device const float *x [[buffer(3)]], device const float *m [[buffer(4)]], device float *out [[buffer(5)]],
-                        constant GateArgs &a [[buffer(6)]], uint tg [[threadgroup_position_in_grid]],
+                        constant GateArgs &a [[buffer(6)]], uint2 tg [[threadgroup_position_in_grid]],
                         uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
-    uint c = tg * MV_SG + sg;
+    uint c = tg.x * MV_SG + sg;
     if (c >= a.d) return;
+    z += (ulong)tg.y * a.rank;
+    x += (ulong)tg.y * a.d;
+    m += (ulong)tg.y * a.d;
+    out += (ulong)tg.y * a.d;
     device const float *fr = F + (ulong)c * a.rank;
     device const float *gr = G + (ulong)c * a.rank;
     float f = 0.0f, g = 0.0f;

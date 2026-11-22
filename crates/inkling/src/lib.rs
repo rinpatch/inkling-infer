@@ -2,6 +2,7 @@
 //! every faster backend is tested against.
 
 pub mod cpu;
+pub mod drafter;
 pub mod hparams;
 pub mod ops;
 pub mod tokenizer;

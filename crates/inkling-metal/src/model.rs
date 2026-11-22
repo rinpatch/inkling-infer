@@ -231,6 +231,8 @@ pub const MAX_BATCH: usize = 512;
 const MOE_NR: usize = 2;
 /// Largest speculative verify batch (anchor + 7 drafts).
 pub const MAX_VERIFY: usize = 8;
+/// Visible keys from which decode attention uses the one-thread-per-key kernel.
+const ATTN_TPK_MIN: usize = 512;
 const MAX_BLOCKS: usize = 8;
 
 /// Trace hook used while encoding: (encoder, name, slot, source buffer, float offset, float count).
@@ -1838,11 +1840,18 @@ impl MetalModel {
                 .next_multiple_of(32)
                 .clamp(ATTN_SPLIT_MIN, ATTN_SPLIT);
             let n_split = n_keys.div_ceil(split);
+            // one thread per key once blocks hold many keys; lane-parallel dots for short ranges
+            let tpk = n_keys
+                >= std::env::var("INKLING_TPK_MIN")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(ATTN_TPK_MIN);
             e.dispatch(
-                if self.kv_f16 {
-                    "attn_split_f16"
-                } else {
-                    "attn_split_f32"
+                match (tpk, self.kv_f16) {
+                    (true, true) => "attn_split_tpk_f16",
+                    (true, false) => "attn_split_tpk_f32",
+                    (false, true) => "attn_split_f16",
+                    (false, false) => "attn_split_f32",
                 },
                 &[
                     buf(&a.q),

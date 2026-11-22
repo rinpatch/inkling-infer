@@ -373,6 +373,85 @@ kernel void attn_split(device const float *q [[buffer(0)]], device const KV *kc 
     }
 }
 
+// attn_split for long key ranges: one thread per key computes the whole dot for every query head
+// of the group, so no cross-lane reductions per key. Faster once there are many keys per block
+// (4K context: +3% decode); with few keys most threads idle on a long serial dot.
+template <typename KV>
+kernel void attn_split_tpk(device const float *q [[buffer(0)]], device const KV *kc [[buffer(1)]], device const KV *vc [[buffer(2)]],
+                       device const float *r [[buffer(3)]], device const float *rel_bias [[buffer(4)]], device float *pm [[buffer(5)]],
+                       device float *pl [[buffer(6)]], device float *pacc [[buffer(7)]], constant SplitArgs &a [[buffer(8)]],
+                       uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+    const uint ntg = a.head_dim;
+    const uint grp = a.n_head / a.n_kv_head;
+    threadgroup float scratch[32];
+    threadgroup float qs[ATTN_MAX_GRP * 128];
+    threadgroup float rs[ATTN_MAX_GRP * 32];
+    threadgroup float pl_t[ATTN_MAX_GRP][ATTN_CHUNK];
+    uint kvh = tg.x, s = tg.y;
+    for (uint g = 0; g < grp; ++g) {
+        uint h = kvh * grp + g;
+        for (uint i = tid; i < a.head_dim; i += ntg) qs[g * a.head_dim + i] = q[h * a.head_dim + i];
+        for (uint i = tid; i < a.n_rel; i += ntg) rs[g * a.n_rel + i] = r[h * a.n_rel + i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint lo = a.first + s * a.split;
+    uint hi = min(lo + a.split, a.pos + 1);
+    float m[ATTN_MAX_GRP], l[ATTN_MAX_GRP], acc[ATTN_MAX_GRP];
+    for (uint g = 0; g < grp; ++g) { m[g] = -INFINITY; l[g] = 0.0f; acc[g] = 0.0f; }
+    threadgroup float lg_t[ATTN_MAX_GRP][ATTN_CHUNK];
+    for (uint j0 = lo; j0 < hi; j0 += ATTN_CHUNK) {
+        uint n = min((uint)ATTN_CHUNK, hi - j0);
+        // logits: one thread per key, the whole 128-dim dot for every query head of the group (q is
+        // in threadgroup memory), so no cross-lane reductions; the thread also dots its key's
+        // relative-bias row with each head's r (0 past the extent)
+        if (tid < n) {
+            uint j = j0 + tid;
+            device const vec<KV, 4> *kr = (device const vec<KV, 4> *)(kc + (ulong)j * a.kv_dim + kvh * a.head_dim);
+            float d[ATTN_MAX_GRP] = {0.0f, 0.0f, 0.0f, 0.0f};
+            for (uint i = 0; i < 32; ++i) {
+                float4 kv = float4(kr[i]);
+                for (uint g = 0; g < grp; ++g) d[g] += dot(((threadgroup const float4 *)(qs + g * a.head_dim))[i], kv);
+            }
+            uint dist = a.pos - j;
+            float bias[ATTN_MAX_GRP] = {0.0f, 0.0f, 0.0f, 0.0f};
+            if (dist < a.extent) {
+                device const float *rb = rel_bias + (ulong)dist * a.n_rel;
+                for (uint i = 0; i < a.n_rel; ++i) {
+                    float w = rb[i];
+                    for (uint g = 0; g < grp; ++g) bias[g] += rs[g * a.n_rel + i] * w;
+                }
+            }
+            for (uint g = 0; g < grp; ++g) lg_t[g][tid] = d[g] * a.scale + bias[g];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float lg[ATTN_MAX_GRP];
+        for (uint g = 0; g < grp; ++g) lg[g] = tid < n ? lg_t[g][tid] : -INFINITY;
+        for (uint g = 0; g < grp; ++g) {
+            float m_new = max(m[g], tg_max(lg[g], scratch, tid, ntg));
+            float p = tid < n ? exp(lg[g] - m_new) : 0.0f;
+            pl_t[g][tid] = p;
+            float corr = exp(m[g] - m_new);
+            l[g] = l[g] * corr + tg_sum(p, scratch, tid, ntg);
+            acc[g] *= corr;
+            m[g] = m_new;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        device const KV *vp = vc + (ulong)j0 * a.kv_dim + kvh * a.head_dim + tid;
+        for (uint jj = 0; jj < n; ++jj) {
+            float v = float(vp[(ulong)jj * a.kv_dim]);
+            for (uint g = 0; g < grp; ++g) acc[g] += pl_t[g][jj] * v;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint g = 0; g < grp; ++g) {
+        uint h = kvh * grp + g;
+        uint idx = h * a.n_split + s;
+        if (tid == 0) { pm[idx] = m[g]; pl[idx] = l[g]; }
+        pacc[(ulong)idx * a.head_dim + tid] = acc[g];
+    }
+}
+
 struct CombineAttnArgs {
     uint head_dim;
     uint n_split;
@@ -466,6 +545,12 @@ template [[host_name("conv_head_f16")]] kernel void conv_head<half>(device const
     template [[host_name("attn_split_" name)]] kernel void attn_split<KV>(device const float *, device const KV *, device const KV *,     \
                                                                          device const float *, device const float *, device float *,       \
                                                                          device float *, device float *, constant SplitArgs &, uint2, uint);
+#define ATTN_TPK_INSTANCES(KV, name)                                                                                                    \
+    template [[host_name("attn_split_tpk_" name)]] kernel void attn_split_tpk<KV>(device const float *, device const KV *, device const KV *, \
+                                                                                 device const float *, device const float *, device float *, \
+                                                                                 device float *, device float *, constant SplitArgs &, uint2, uint);
+ATTN_TPK_INSTANCES(float, "f32")
+ATTN_TPK_INSTANCES(half, "f16")
 ATTN_INSTANCES(float, "f32")
 ATTN_INSTANCES(half, "f16")
 

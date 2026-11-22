@@ -80,13 +80,27 @@ fn main() -> anyhow::Result<()> {
         let p1 = m.profile_batch(&head[100..101])?;
         m.rewind(1, 1)?;
         let p4 = m.profile_batch(&head[100..104])?;
-        let get = |p: &Vec<(String, f64, usize)>, k: &str| p.iter().find(|x| x.0 == k).map_or(0.0, |x| x.1);
-        let mut rows: Vec<(String, f64, f64)> = p4.iter().map(|(k, t, _)| (k.clone(), get(&p1, k), *t)).collect();
+        let get = |p: &Vec<(String, f64, usize)>, k: &str| {
+            p.iter().find(|x| x.0 == k).map_or(0.0, |x| x.1)
+        };
+        let mut rows: Vec<(String, f64, f64)> = p4
+            .iter()
+            .map(|(k, t, _)| (k.clone(), get(&p1, k), *t))
+            .collect();
         rows.sort_by(|a, b| (b.2 - b.1).total_cmp(&(a.2 - a.1)));
         let (t1, t4): (f64, f64) = (p1.iter().map(|x| x.1).sum(), p4.iter().map(|x| x.1).sum());
-        println!("profile total: 1 token {:.1}  4 tokens {:.1}", t1 * 1e3, t4 * 1e3);
+        println!(
+            "profile total: 1 token {:.1}  4 tokens {:.1}",
+            t1 * 1e3,
+            t4 * 1e3
+        );
         for (k, a, b) in rows.iter().take(10) {
-            println!("  {k:28} 1 tok {:7.2}  4 tok {:7.2}  +{:6.2}", a * 1e3, b * 1e3, (b - a) * 1e3);
+            println!(
+                "  {k:28} 1 tok {:7.2}  4 tok {:7.2}  +{:6.2}",
+                a * 1e3,
+                b * 1e3,
+                (b - a) * 1e3
+            );
         }
     }
     let kvd = dc::N_KV * dc::HEAD_DIM;

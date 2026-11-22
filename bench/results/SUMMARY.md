@@ -23,3 +23,14 @@ Decode roofline ≈ 68 tok/s (≈4.0 GB of weights read per token, see docs/refe
 |---|---|---|---|---|---|
 | 2026-11-22 | llama.cpp c66103334 | Metal | 302.3 ± 0.4 | 27.5 ± 0.1 | 26.1 ± 0.2 |
 | 2026-11-22 | llama.cpp c66103334 | CPU, 10 threads | 91.3 ± 0.7 | 22.8 ± 4.1 (tg64) | – |
+
+## Osaurus (vmlx-swift `310c583`, the Inkling JANGH merge), 2026-11-22
+
+`OsaurusAI/Inkling-2-Mini-JANGH2` (10.2 GB: 2.34-bpw Hadamard-codebook experts, affine 8-bit trunk), run with vmlx-swift's RunBench on the same 512- and 4096-token prompts (fixtures/prompts/long.txt, HF tokenization), greedy, 128 tokens. Decode is measured *after* the prompt (at ~512 and ~4096 context).
+
+| engine | weights | pp512 | decode @512 | pp4096 | decode @4096 |
+|---|---|---|---|---|---|
+| Osaurus | JANGH2 | 267 | 48.3 | 333 | 45.7 |
+| ours `b402c50` | IQ4_NL GGUF | ~307 | 40.7 (@0) | ~213 | 34.2 |
+
+Setup notes: RunBench's generic loader tries the VLM factory first, which can't decode `jangtq2`. The LLM factory has the Inkling JANGH preparation but refuses symlinked files, so the HF snapshot has to be copied as regular files (`cp -R -L -c`, an APFS clone) to `~/models/Inkling-2-Mini-JANGH2`. Most of the decode gap is format: about 3.1 vs 4.0 GB read per token.

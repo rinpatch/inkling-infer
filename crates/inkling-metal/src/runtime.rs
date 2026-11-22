@@ -397,6 +397,13 @@ impl Encoder<'_> {
         let p = self.ctx.pipeline(kernel)?;
         // a kernel's register use can lower its thread limit below what the caller dispatches;
         // Metal would then not run it correctly, without any error
+        let shared = p.staticThreadgroupMemoryLength();
+        let shared_max = self.ctx.device.maxThreadgroupMemoryLength();
+        if shared > shared_max {
+            return Err(Error::Metal(format!(
+                "{kernel}: {shared} bytes of threadgroup memory, the device allows {shared_max}"
+            )));
+        }
         let max = p.maxTotalThreadsPerThreadgroup();
         if threads.0 * threads.1 * threads.2 > max {
             return Err(Error::Metal(format!(

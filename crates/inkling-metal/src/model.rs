@@ -788,9 +788,9 @@ impl MetalModel {
             )
         } else {
             e.dispatch(
-                self.tile("gemm_q8_0_multi").as_str(),
+                self.tile("gemm2_q8_0_multi").as_str(),
                 &binds,
-                ((start as usize).div_ceil(GEMM_BM), nt.div_ceil(GEMM_BN), 1),
+                ((start as usize).div_ceil(GEMM_BM2), nt.div_ceil(GEMM_BN), 1),
                 (128, 1, 1),
             )
         }
@@ -1534,9 +1534,9 @@ impl MetalModel {
             binds.extend((0..8).map(|_| buf(&a.wo_out)));
             binds.push(bytes(&args));
             e.dispatch(
-                self.tile("gemm_q8_0_multi").as_str(),
+                self.tile("gemm2_q8_0_multi").as_str(),
                 &binds,
-                (d.div_ceil(GEMM_BM), nt.div_ceil(GEMM_BN), 1),
+                (d.div_ceil(GEMM_BM2), nt.div_ceil(GEMM_BN), 1),
                 (128, 1, 1),
             )?;
         }

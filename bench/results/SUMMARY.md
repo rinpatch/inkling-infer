@@ -107,3 +107,26 @@ Speculation loses in both engines on this machine: verifying extra tokens of thi
 
 - Token-parallel short convolutions (committed): pp512 +7% / +1%, pp4096 −2% / +3% in a noisy two-round A/B; decode unchanged.
 - Relative bias computed per score inside attn_tiled instead of the rel_table pass (reverted): pp4096 288 / 276 vs 338 / 313 (−12–15%), pp512 −1–3%. Sixteen extra multiply-adds and a device load per score stall the MMA loop more than the 25 MB/layer table costs. llama.cpp's #32808 gathers precomputed bias values in its kernel instead.
+
+## Prefill: MoE tiling and occupancy (37b5137 vs 334f3cc), 2026-11-23
+
+`bench/ab.sh 334f3cc 2`:
+
+| test | base round 1 / 2 | new round 1 / 2 |
+|---|---|---|
+| pp512 | 340.9 / 341.0 | **440.7** / 357.2 |
+| tg128 @ 0 | 43.26 / 43.17 | 43.37 / 41.06 |
+| pp4096 | 331.2 / 303.0 | **405.6** / 356.4 |
+| tg128 @ 4096 | 37.27 / 36.54 | 37.16 / 36.72 |
+
+Round 1 is clean: prefill +29% at 512 and +22% at 4096, decode unchanged. In round 2 the machine throttled (the new build's decode, which runs code these commits did not touch, read 41.1 against 43.2), so its prefill gains are understated.
+
+Where it came from, measured by running each kernel family twice (INKLING_DOUBLE) in a 512-token batch: two-thirds of prefill was MoE GEMMs, at ~3.5 TFLOP/s.
+- 32- and 16-pair tiles from a work list (0c856a6): routing is uneven, so one-size 32-pair tiles ran 63% full. pp512 351 → 388.
+- Bias table only for distances the batch reaches (3f6486c): pp512 → 394.
+- MoE GEMM results written straight from the accumulators (6044abe): the f32 epilogue tiles had sized threadgroup memory at 16-20 KB, one MoE threadgroup per core. pp512 → 442.
+- Token-parallel short convolutions (76004b0): a few percent.
+
+Tried and dropped: relative bias computed inside attn_tiled (pp4096 −12-15%); per-token message-gate kernels for batches (pp512 351 → 302); 64-pair tiles for busy experts (slower, 413 vs 443, and produced wrong results, not debugged).
+
+Updated standing against llama.cpp's best build (#32808, flash-attention bias, measured earlier today): pp512 378.4 vs ours ~441, pp4096 343.4 vs ~406, tg128 27.2 vs 43.4, tg128 @ 4K 26.1 vs 37.2.

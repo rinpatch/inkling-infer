@@ -70,3 +70,35 @@ Runner stats on this greedy text: 50–65% of drafted tokens accepted, 1.6–3.9
 | tg128 @ 4096 | 34.26 / 34.10 | **36.42 / 35.94** |
 
 Decode +4-7% at empty context and +5-6% at 4K (64% / 54% of the roofline). The concurrent groups alone measured +1-3% in an earlier A/B; the rest is decode_greedy (argmax on the GPU, two command buffers in flight). Prefill moves both ways between rounds (thermal noise in round 2 for both builds).
+
+## vs llama.cpp master and the open Inkling performance PRs, 2026-11-23
+
+Same session, AC power, `llama-bench -ngl 99 -r 3` (`-d 4096` for decode at depth) on the same IQ4_NL GGUF; ours via `inkling bench`. Builds in worktrees under ~/sw/llama-prs, each at its PR head (19-27 commits behind master).
+
+| engine | pp512 | pp4096 | tg128 | tg128 @ 4K |
+|---|---|---|---|---|
+| llama.cpp master `94f3af3d0`, `-fa 0` | 313.1 | 262.9 | 26.6 | 23.9 |
+| llama.cpp master, `-fa 1` | 305.1 | 234.4 | 26.4 | 24.9 |
+| + #32808 Metal indexed bias in FLASH_ATTN_EXT (on #32740) `167ad27b9` | **378.4** | **343.4** | 27.2 | 26.1 |
+| + #32752 build the mask in chunks `56a4ac9ee` | 306.8 | 239.1 | 26.9 | 25.8 |
+| ours `b4b99b7` | 326.6 | 319.9 | **42.9** | **37.2** |
+
+- Master can't use flash attention for Inkling at all: the relative bias blocks it (docs/llama.cpp-backports.md). #32740/#32808 move the bias inside the flash-attention kernel, which makes llama.cpp's prefill faster than ours (+16% at 512, +7% at 4096). Its decode moves only +2-5%.
+- #32752 is about compute-buffer memory; speed is neutral at these sizes.
+- #32752 conflicts with #32808 in src/models/inkling2.cpp (both rewrite the mask/bias path), so they were not combined.
+- Decode: ours is 1.58x the best llama.cpp build at short context and 1.43x at 4K.
+
+### DSpark speculative decoding: llama.cpp #32218 vs ours, same chat prompt (LRU-cache code, 256 tokens, greedy)
+
+llama.cpp through llama-server (`llama-speculative` can't create the DSpark draft context) with a drafter converted by the PR's own `convert_hf_to_gguf.py --dspark --outtype q8_0` from the native mtp.safetensors (unsloth's dspark GGUF has a padded markov_w1 that the PR rejects); bench/llama_dspark.sh. Ours: `inkling run --chat --draft`, INKLING_DRAFTS = drafts per round.
+
+| drafts per round | llama.cpp tok/s (accepted / drafted) | ours tok/s (accepted drafts / round) |
+|---|---|---|
+| none | 27.13 | 40.8 |
+| 1 | 25.08 (106 / 148) | 39.1 (0.67) |
+| 2 | 25.67 (133 / 241) | 37.8 (1.00) |
+| 3 | 25.08 (146 / 322) | 32.8 (1.11) |
+| 4 | 23.80 (151 / 408) | – |
+| 7 | 19.64 (153 / 694) | 19.3 (1.22) |
+
+Speculation loses in both engines on this machine: verifying extra tokens of this MoE model costs about as much as it saves (docs/dspark.md). #32773 reports +68% on an RX 9070 XT, a GPU with far more compute per byte of bandwidth. llama.cpp accepts slightly more drafts (72% vs 67% at 1 draft).

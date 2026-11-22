@@ -32,12 +32,13 @@ struct Args {
     pp: usize,
     tg: usize,
     reps: usize,
+    depth: usize,
     json: Option<String>,
 }
 
 const USAGE: &str = "usage:
   inkling run   -m <model.gguf> -p <prompt> [-f file] [-n N] [--chat] [--temp T] [--seed S] [--backend metal|cpu]
-  inkling bench -m <model.gguf> [--pp 512] [--tg 128] [-r 5] [--backend metal|cpu] [--json out.json]";
+  inkling bench -m <model.gguf> [--pp 512] [--tg 128] [-r 5] [-d depth] [--backend metal|cpu] [--json out.json]";
 
 fn parse() -> Result<Args> {
     let mut it = std::env::args().skip(1);
@@ -57,6 +58,7 @@ fn parse() -> Result<Args> {
         pp: 512,
         tg: 128,
         reps: 5,
+        depth: 0,
         json: None,
     };
     while let Some(arg) = it.next() {
@@ -73,6 +75,7 @@ fn parse() -> Result<Args> {
             "--tg" => a.tg = val()?.parse()?,
             "-r" | "--reps" => a.reps = val()?.parse()?,
             "--json" => a.json = Some(val()?),
+            "-d" | "--depth" => a.depth = val()?.parse()?,
             "--backend" => {
                 a.backend = match val()?.as_str() {
                     "cpu" => BackendKind::Cpu,
@@ -245,12 +248,12 @@ fn bench(args: &Args, g: &gguf::Gguf, hp: &Hparams) -> Result<()> {
     } else {
         "cpu"
     };
-    let tokens: Vec<u32> = (0..args.pp.max(args.tg) as u32)
+    let tokens: Vec<u32> = (0..(args.pp.max(args.tg) + args.depth) as u32)
         .map(|i| 1000 + (i * 7919) % 150000)
         .collect();
     let mut pp = Vec::new();
     let mut tg = Vec::new();
-    let mut eng = Engine::new(args.backend, g, hp, args.pp.max(args.tg) + 1)?;
+    let mut eng = Engine::new(args.backend, g, hp, args.pp.max(args.tg) + args.depth + 1)?;
     for rep in 0..=args.reps {
         // rep 0 is warmup (pipeline compilation, page faults on the weights)
         if args.pp > 0 {
@@ -263,6 +266,10 @@ fn bench(args: &Args, g: &gguf::Gguf, hp: &Hparams) -> Result<()> {
         }
         if args.tg > 0 {
             eng.reset(hp);
+            // decode after `depth` tokens of context, like llama-bench -d
+            if args.depth > 0 {
+                eng.prefill(&tokens[..args.depth])?;
+            }
             let mut next = tokens[0];
             let t = Instant::now();
             for _ in 0..args.tg {
@@ -292,11 +299,12 @@ fn bench(args: &Args, g: &gguf::Gguf, hp: &Hparams) -> Result<()> {
     if !tg.is_empty() {
         let (m, s) = mean_std(&tg);
         println!(
-            "{backend:6} tg{:<5} {m:8.2} ± {s:.2} tok/s  ({:.0}% of the ~{ROOFLINE_TOK_S:.0} tok/s roofline)",
+            "{backend:6} tg{} @ depth {:<5} {m:8.2} ± {s:.2} tok/s  ({:.0}% of the ~{ROOFLINE_TOK_S:.0} tok/s roofline)",
             args.tg,
+            args.depth,
             100.0 * m / ROOFLINE_TOK_S
         );
-        json.push(format!(r#"{{"backend":"{backend}","test":"tg{}","avg_ts":{m:.4},"stddev_ts":{s:.4},"samples":{tg:?}}}"#, args.tg));
+        json.push(format!(r#"{{"backend":"{backend}","test":"tg{}","depth":{},"avg_ts":{m:.4},"stddev_ts":{s:.4},"samples":{tg:?}}}"#, args.tg, args.depth));
     }
     if let (Engine::Metal(m), true) = (&mut eng, std::env::var_os("INKLING_PROFILE").is_some()) {
         m.reset();

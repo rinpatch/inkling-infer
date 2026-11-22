@@ -201,9 +201,15 @@ fn check_fixture(name: &str, tol: Tolerance) {
     for (key, rows) in &rec.rows {
         let want = fx.read(key);
         let per = rows[0].len();
-        // `result_*` only exists for the last prompt token in llama.cpp
+        // llama.cpp only computes `result_*` for the last token of each ubatch; the long fixture
+        // used 512-token ubatches (fixtures/README.md), the others a single ubatch
+        let n_ub = fx.tensors[key].len();
         let got: Vec<f32> = if want.len() == per {
             rows.last().unwrap().clone()
+        } else if key.starts_with("result_") && want.len() == per * n_ub {
+            (0..n_ub)
+                .flat_map(|u| rows[((u + 1) * 512).min(rows.len()) - 1].clone())
+                .collect()
         } else {
             rows.concat()
         };

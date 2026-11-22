@@ -203,6 +203,8 @@ const MV_SG: usize = 8;
 /// GEMM tile sizes (kernels/gemm.metal BM, BN).
 const GEMM_BM: usize = 32;
 const GEMM_BN: usize = 32;
+/// Rows per tile in the expert GEMMs (kernels/gemm.metal BM2).
+const GEMM_BM2: usize = 64;
 /// Tokens per prefill command buffer.
 pub const MAX_BATCH: usize = 512;
 /// Rows per simdgroup in the MoE kernels (kernels/matvec.metal MOE_NR).
@@ -1170,7 +1172,7 @@ impl MetalModel {
             situ_lin: hp.situ_linear_beta,
         };
         e.dispatch(
-            &self.tile(&format!("moe_gemm_gate_up_{}", lw.exp_kind)),
+            &self.tile(&format!("moe_gemm2_gate_up_{}", lw.exp_kind)),
             &[
                 buf_at(&self.w, lw.gate_up.0),
                 buf(&a.n),
@@ -1181,14 +1183,14 @@ impl MetalModel {
                 bytes(&gm),
             ],
             (
-                hp.n_ff_exp.div_ceil(GEMM_BM),
+                hp.n_ff_exp.div_ceil(GEMM_BM2),
                 max_pairs.div_ceil(GEMM_BN),
                 hp.n_expert,
             ),
             (128, 1, 1),
         )?;
         e.dispatch(
-            &self.tile(&format!("moe_gemm_down_{}", lw.exp_kind)),
+            &self.tile(&format!("moe_gemm2_down_{}", lw.exp_kind)),
             &[
                 buf_at(&self.w, lw.down.0),
                 buf(&a.act),
@@ -1199,7 +1201,7 @@ impl MetalModel {
                 bytes(&gm),
             ],
             (
-                d.div_ceil(GEMM_BM),
+                d.div_ceil(GEMM_BM2),
                 max_pairs.div_ceil(GEMM_BN),
                 hp.n_expert,
             ),

@@ -1980,7 +1980,9 @@ impl MetalModel {
                         extent: lw.rel_extent as u32,
                     }),
                 ],
-                (lw.rel_extent.div_ceil(256), nt * nh, 1),
+                // distances in this batch are below pos + nt, so the rest of the table is never read
+                // (half of it for a 512-token prompt from position 0)
+                (lw.rel_extent.min(self.pos + nt).div_ceil(256), nt * nh, 1),
                 (256, 1, 1),
             )?;
             let kernel = format!(

@@ -395,6 +395,15 @@ impl Encoder<'_> {
         threads: (usize, usize, usize),
     ) -> Result<()> {
         let p = self.ctx.pipeline(kernel)?;
+        // a kernel's register use can lower its thread limit below what the caller dispatches;
+        // Metal would then not run it correctly, without any error
+        let max = p.maxTotalThreadsPerThreadgroup();
+        if threads.0 * threads.1 * threads.2 > max {
+            return Err(Error::Metal(format!(
+                "{kernel}: {} threads per threadgroup, the compiled pipeline allows {max}",
+                threads.0 * threads.1 * threads.2
+            )));
+        }
         let own;
         let enc = match (&self.enc, &mut self.profile) {
             (Some(e), _) => e,

@@ -9,7 +9,7 @@ use inkling::cpu::{CpuModel, State};
 use inkling::tokenizer::Tokenizer;
 use inkling::weights::Weights;
 use inkling::{Hparams, NoTrace};
-use inkling_metal::model::MetalModel;
+use inkling_metal::model::{MAX_VERIFY, MetalModel};
 
 /// Decode roofline (tok/s) from ARCHITECTURE.md: bytes read per token over 273 GB/s.
 const ROOFLINE_TOK_S: f64 = 68.0;
@@ -34,11 +34,16 @@ struct Args {
     reps: usize,
     depth: usize,
     json: Option<String>,
+    /// native checkpoint directory with mtp.safetensors: speculative greedy decoding (Metal)
+    draft: Option<String>,
 }
 
 const USAGE: &str = "usage:
-  inkling run   -m <model.gguf> -p <prompt> [-f file] [-n N] [--chat] [--temp T] [--seed S] [--backend metal|cpu]
-  inkling bench -m <model.gguf> [--pp 512] [--tg 128] [-r 5] [-d depth] [--backend metal|cpu] [--json out.json]";
+  inkling run   -m <model.gguf> -p <prompt> [-f file] [-n N] [--chat] [--temp T] [--seed S] [--backend metal|cpu] [--draft <native dir>]
+  inkling bench -m <model.gguf> [--pp 512] [--tg 128] [-r 5] [-d depth] [--backend metal|cpu] [--json out.json] [--draft <native dir>]
+
+  --draft: speculative greedy decoding with the DSpark drafter from the native checkpoint
+           (thinkingmachines/Inkling-2-Mini, mtp.safetensors); Metal only, temperature 0";
 
 fn parse() -> Result<Args> {
     let mut it = std::env::args().skip(1);
@@ -60,6 +65,7 @@ fn parse() -> Result<Args> {
         reps: 5,
         depth: 0,
         json: None,
+        draft: None,
     };
     while let Some(arg) = it.next() {
         let mut val = || it.next().with_context(|| format!("{arg} needs a value"));
@@ -76,6 +82,7 @@ fn parse() -> Result<Args> {
             "-r" | "--reps" => a.reps = val()?.parse()?,
             "--json" => a.json = Some(val()?),
             "-d" | "--depth" => a.depth = val()?.parse()?,
+            "--draft" => a.draft = Some(val()?),
             "--backend" => {
                 a.backend = match val()?.as_str() {
                     "cpu" => BackendKind::Cpu,
@@ -127,6 +134,14 @@ impl<'g> Engine<'g> {
                 }
                 Ok(logits)
             }
+        }
+    }
+
+    /// Loads the DSpark drafter (Metal only).
+    fn attach_draft(&mut self, dir: &str) -> Result<()> {
+        match self {
+            Engine::Metal(m) => Ok(m.load_drafter(dir)?),
+            Engine::Cpu(_) => bail!("--draft needs the Metal backend"),
         }
     }
 
@@ -191,11 +206,41 @@ fn run(args: &Args, g: &gguf::Gguf, hp: &Hparams) -> Result<()> {
     if ids.is_empty() {
         bail!("empty prompt");
     }
-    let mut eng = Engine::new(args.backend, g, hp, ids.len() + args.n_gen + 1)?;
+    let mut eng = Engine::new(args.backend, g, hp, ids.len() + args.n_gen + 1 + MAX_VERIFY)?;
+    if let Some(dir) = &args.draft {
+        if args.temp > 0.0 {
+            bail!("--draft decodes greedily; drop --temp");
+        }
+        eng.attach_draft(dir)?;
+    }
 
     let t0 = Instant::now();
     let mut logits = eng.prefill(&ids)?;
     let t_prompt = t0.elapsed().as_secs_f64();
+
+    if let (Some(_), Engine::Metal(m)) = (&args.draft, &mut eng) {
+        let first = sample(&logits, 0.0, &mut Rng(1));
+        let t1 = Instant::now();
+        let spec = m.decode_speculative(first, args.n_gen.saturating_sub(1))?;
+        let t_gen = t1.elapsed().as_secs_f64();
+        let mut toks = vec![first];
+        toks.extend(&spec.tokens);
+        if let Some(e) = toks.iter().position(|&t| t == tok.eos) {
+            toks.truncate(e);
+        }
+        println!("{}", tok.decode(&toks));
+        eprintln!(
+            "prompt: {} tokens in {:.2}s ({:.2} tok/s) | gen: {} tokens in {:.2}s ({:.2} tok/s), {:.2} accepted drafts per round",
+            ids.len(),
+            t_prompt,
+            ids.len() as f64 / t_prompt,
+            spec.tokens.len() + 1,
+            t_gen,
+            (spec.tokens.len() + 1) as f64 / t_gen,
+            spec.accepted as f64 / spec.rounds.max(1) as f64
+        );
+        return Ok(());
+    }
 
     let mut rng = Rng(args.seed.wrapping_mul(0x9E3779B97F4A7C15) | 1);
     let mut out = std::io::stdout().lock();
@@ -253,7 +298,16 @@ fn bench(args: &Args, g: &gguf::Gguf, hp: &Hparams) -> Result<()> {
         .collect();
     let mut pp = Vec::new();
     let mut tg = Vec::new();
-    let mut eng = Engine::new(args.backend, g, hp, args.pp.max(args.tg) + args.depth + 1)?;
+    let mut eng = Engine::new(
+        args.backend,
+        g,
+        hp,
+        args.pp.max(args.tg) + args.depth + 1 + MAX_VERIFY,
+    )?;
+    if let Some(dir) = &args.draft {
+        eng.attach_draft(dir)?;
+    }
+    let mut spec_acc = Vec::new();
     for rep in 0..=args.reps {
         // rep 0 is warmup (pipeline compilation, page faults on the weights)
         if args.pp > 0 {
@@ -273,6 +327,10 @@ fn bench(args: &Args, g: &gguf::Gguf, hp: &Hparams) -> Result<()> {
             let t = Instant::now();
             match &mut eng {
                 // greedy decode with the pick on the GPU and steps queued back to back
+                Engine::Metal(m) if args.draft.is_some() => {
+                    let s = m.decode_speculative(tokens[0], args.tg)?;
+                    spec_acc.push(s.accepted as f64 / s.rounds as f64);
+                }
                 Engine::Metal(m) => {
                     m.decode_greedy(tokens[0], args.tg)?;
                 }
@@ -313,6 +371,13 @@ fn bench(args: &Args, g: &gguf::Gguf, hp: &Hparams) -> Result<()> {
             100.0 * m / ROOFLINE_TOK_S
         );
         json.push(format!(r#"{{"backend":"{backend}","test":"tg{}","depth":{},"avg_ts":{m:.4},"stddev_ts":{s:.4},"samples":{tg:?}}}"#, args.tg, args.depth));
+    }
+    if !spec_acc.is_empty() {
+        let (m, _) = mean_std(&spec_acc);
+        // the bench feeds synthetic token ids, so acceptance here is not representative of text
+        println!(
+            "       speculative: {m:.2} accepted drafts per round (synthetic tokens; measure text with `inkling run --draft`)"
+        );
     }
     if let (Engine::Metal(m), true) = (&mut eng, std::env::var_os("INKLING_PROFILE").is_some()) {
         m.reset();

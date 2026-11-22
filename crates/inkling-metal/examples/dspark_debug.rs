@@ -37,6 +37,47 @@ fn main() -> anyhow::Result<()> {
     }
     let anchor = last[0];
     let dbg = m.debug_draft(anchor)?;
+    for _ in 0..3 {
+        m.debug_draft(anchor)?;
+        println!(
+            "draft: {:.2} ms GPU, {} dispatches",
+            m.last.gpu_s * 1e3,
+            m.last.n_dispatch
+        );
+    }
+    for _ in 0..3 {
+        m.step(anchor, &mut inkling::NoTrace)?;
+        println!("decode step: {:.2} ms GPU", m.last.gpu_s * 1e3);
+    }
+    for n in [1usize, 2, 3, 4, 6, 8] {
+        m.verify(&head[100..100 + n])?;
+        m.verify(&head[100..100 + n])?;
+        println!("verify {n}: {:.2} ms GPU", m.last.gpu_s * 1e3);
+        m.rewind(2 * n, 1)?;
+    }
+    for _ in 0..3 {
+        m.verify(&head[100..108])?;
+        let ids = m.debug_last_ids(8);
+        let mut u = ids.clone();
+        u.sort();
+        u.dedup();
+        println!(
+            "last layer: {} distinct experts of {} pairs",
+            u.len(),
+            ids.len()
+        );
+        println!(
+            "verify 8: {:.2} ms GPU, {} dispatches",
+            m.last.gpu_s * 1e3,
+            m.last.n_dispatch
+        );
+        m.rewind(8, 1)?;
+    }
+    if std::env::var_os("INKLING_PROFILE").is_some() {
+        for (k, t, n) in m.profile_batch(&head[100..108])?.iter().take(12) {
+            println!("  {k:28} {:6.2} ms  x{n}", t * 1e3);
+        }
+    }
     let kvd = dc::N_KV * dc::HEAD_DIM;
     println!(
         "ctx key pos 0:      rel {:.2e}",

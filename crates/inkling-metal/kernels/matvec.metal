@@ -293,6 +293,7 @@ kernel void msg_gate_up(device const float *F [[buffer(0)]], device const float 
 // [start, start+rows) of the matrix at byte offset woff and writes output buffer o_s.
 
 #define MULTI_MAX 8
+#define MULTI_NT 8  // most tokens per mv_q8_0_multi dispatch
 
 struct MultiSeg {
     ulong woff;
@@ -304,7 +305,7 @@ struct MultiArgs {
     uint cols;
     uint n_seg;
     uint total_rows;
-    uint pad;
+    uint n_tokens;
     MultiSeg seg[MULTI_MAX];
 };
 
@@ -320,10 +321,30 @@ kernel void mv_q8_0_multi(device const uchar *W [[buffer(0)]], device const floa
     uint lr = r - a.seg[s].start;
     uint nb = a.cols / QK;
     device const block_q8_0 *row = (device const block_q8_0 *)(W + a.seg[s].woff) + (ulong)lr * nb;
-    float v = simd_sum(dot_q8_0_lane(row, x, nb, lane));
-    if (lane != 0) return;
     device float *outs[MULTI_MAX] = {o0, o1, o2, o3, o4, o5, o6, o7};
-    outs[s][lr] = v;
+    if (a.n_tokens <= 1) {
+        float v = simd_sum(dot_q8_0_lane(row, x, nb, lane));
+        if (lane == 0) outs[s][lr] = v;
+        return;
+    }
+    // short batches (speculative verify): each weight half-block is loaded once and dotted with
+    // every token's x; y is [n_tokens][segment rows] like the GEMM
+    float acc[MULTI_NT] = {0};
+    uint nt = min(a.n_tokens, (uint)MULTI_NT);
+    for (uint t = lane; t < 2 * nb; t += 32) {
+        uint b = t / 2, h = t % 2;
+        device const packed_char4 *q = (device const packed_char4 *)(row[b].qs + 16 * h);
+        float4 q0 = float4(char4(q[0])), q1 = float4(char4(q[1])), q2 = float4(char4(q[2])), q3 = float4(char4(q[3]));
+        float dsc = float(row[b].d);
+        for (uint k = 0; k < nt; ++k) {
+            device const float4 *xv = (device const float4 *)(x + (ulong)k * a.cols + b * QK + 16 * h);
+            acc[k] += dsc * (dot(q0, xv[0]) + dot(q1, xv[1]) + dot(q2, xv[2]) + dot(q3, xv[3]));
+        }
+    }
+    for (uint k = 0; k < nt; ++k) {
+        float v = simd_sum(acc[k]);
+        if (lane == 0) outs[s][(ulong)k * a.seg[s].rows + lr] = v;
+    }
 }
 
 // y[t][r] = W[r] . x[t] with a whole threadgroup per row (split over its simdgroups), for short

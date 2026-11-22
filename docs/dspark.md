@@ -79,3 +79,19 @@ Choosing each draft only among the top-k tokens of the base logits (so the Marko
   - If acceptance is poor: distill the drafter (3 layers) on hidden states and tokens from our engine.
 - **Verify cost.** Ollama's verify steps cost ~2x a decode step. Ours must stay below about (1 + accepted tokens per round)× a decode step to win.
 - **Draft cost per round.** About 1 lm_head pass over 7 rows (490 MB), 7 W_fold reads (Q8_0, about 385 MB) and 3 small layers (about 300 MB): roughly 1.2 GB of reads, about 30% of a target step. W_fold could be shrunk further (it only needs to rank candidates near the top of `base`).
+
+## Measured on Metal (decode_speculative, d0b8b1e and later)
+
+Verify cost grows linearly with the batch: 24 ms for 1 token, then about +10.6 ms per extra token (35.5 / 44.4 / 55.2 / 76.2 ms for 2 / 3 / 4 / 6; ~100 ms for 8). Drafting costs 12.7 ms. A decode step is 24.6 ms.
+
+`inkling run --chat --draft` on an LRU-cache coding prompt, 256 tokens:
+
+| drafts per round | tok/s | accepted / round |
+|---|---|---|
+| none (plain greedy) | 40.8 | – |
+| 1 | 39.1 | 0.67 |
+| 2 | 37.8 | 1.00 |
+| 3 | 32.8 | 1.11 |
+| 7 | 19.3 | 1.22 |
+
+Break-even at best. Speculation pays when an extra token costs much less than a step. Ollama's step is mostly fixed overhead (47 ms), so its verify rounds are cheap relative to a step. Ours is close to the bandwidth floor, and the marginal 10.6 ms is mostly expert reads: the pair matvec streams each (token, expert) pair's weights. 8 consecutive tokens use only 29–31 distinct experts per layer out of 64 pairs, so a kernel that reads each distinct expert once would cut the marginal cost to about 4 ms. A first grouped-by-expert matvec (moe_group + per-expert matvecs, half-blocks dequantized once and reused across pairs) measured slower (115 ms vs 100 for 8 tokens) and was not kept; why it misses the dedup is the open question. Other short-batch changes that landed: per-token message-gate kernels for batches of 8 or fewer (126 → 101 ms), and mv_q8_0_multi with up to 8 tokens.

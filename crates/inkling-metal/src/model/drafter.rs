@@ -78,6 +78,9 @@ pub struct MetalDrafter {
     s: Scratch,
     /// Positions whose context K/V are committed (kept equal to the target's position).
     len: usize,
+    /// Drafts per round (1..=7; env INKLING_DRAFTS, default 7). The block always has 8 rows; only
+    /// the walk, the base logits and the verify batch shrink.
+    pub n_drafts: usize,
 }
 
 #[repr(C)]
@@ -272,6 +275,11 @@ impl MetalModel {
             vc,
             s,
             len: 0,
+            n_drafts: std::env::var("INKLING_DRAFTS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(DRAFTS)
+                .clamp(1, DRAFTS),
         }));
         self.enable_capture()
     }
@@ -326,12 +334,7 @@ impl MetalModel {
         let mut binds = vec![buf(wb), buf_at(x, x_off * 4)];
         binds.extend((0..8).map(|_| buf_at(y, y_off * 4)));
         binds.push(bytes(&args));
-        e.dispatch(
-            self.tile("gemm2_q8_0_multi").as_str(),
-            &binds,
-            (rows.div_ceil(GEMM_BM2), nt.div_ceil(GEMM_BN), 1),
-            (128, 1, 1),
-        )
+        self.multi(e, &binds, rows, nt, false)
     }
 
     fn dr_norm(
@@ -568,12 +571,13 @@ impl MetalModel {
             self.dr_add(e, &s.x, &s.dn, b * d)?;
         }
         // rows 1..8 -> final norm -> base logits through the target's head -> top-8 candidates
-        self.dr_norm(e, &s.x, d, dr.norm, &s.h, DRAFTS)?;
+        let k = dr.n_drafts;
+        self.dr_norm(e, &s.x, d, dr.norm, &s.h, k)?;
         let mut args = MultiArgs {
             cols: d as u32,
             n_seg: 1,
             total_rows: hp.n_vocab as u32,
-            n_tokens: DRAFTS as u32,
+            n_tokens: k as u32,
             ..Default::default()
         };
         args.seg[0] = MultiSeg {
@@ -584,12 +588,7 @@ impl MetalModel {
         let mut binds = vec![buf(&self.w), buf(&s.h)];
         binds.extend((0..8).map(|_| buf(&s.base)));
         binds.push(bytes(&args));
-        e.dispatch(
-            self.tile("gemm2_q8_0_multi").as_str(),
-            &binds,
-            (hp.n_vocab.div_ceil(GEMM_BM2), 1, 1),
-            (128, 1, 1),
-        )?;
+        self.multi(e, &binds, hp.n_vocab, k, false)?;
         e.dispatch(
             "dr_topk8",
             &[
@@ -600,7 +599,7 @@ impl MetalModel {
                     n: hp.n_vocab as u32,
                 }),
             ],
-            (DRAFTS, 1, 1),
+            (k, 1, 1),
             (256, 1, 1),
         )?;
         // Markov walk
@@ -625,7 +624,7 @@ impl MetalModel {
             self.copy(e, &s.zeros, 0, &s.state, 0, dc::RANK)
         })?;
         let nin = 2 * dc::RANK + 2 * d;
-        for step in 0..DRAFTS {
+        for step in 0..k {
             let prev = if step == 0 { &self.a.tokens } else { &s.prev };
             e.dispatch(
                 "dr_walk_in",
@@ -706,17 +705,15 @@ impl MetalModel {
                 self.conv_snap = Some(self.ctx.buffer(floats * 4)?);
             }
             let p0 = self.pos;
-            self.verify_rows = MAX_VERIFY;
+            let nv_rows = self.dr().n_drafts + 1;
+            self.verify_rows = nv_rows;
             let this = &*self;
             let dr = this.dr();
             let stats = this.ctx.run(|e| {
                 this.dr_draft(e, p0)?;
-                this.encode(
-                    e,
-                    MAX_VERIFY,
-                    Some(&dr.s.logits),
-                    &mut |_, _, _, _, _, _| Ok(()),
-                )?;
+                this.encode(e, nv_rows, Some(&dr.s.logits), &mut |_, _, _, _, _, _| {
+                    Ok(())
+                })?;
                 e.dispatch(
                     "dr_argmax_rows",
                     &[
@@ -724,7 +721,7 @@ impl MetalModel {
                         buf(&dr.s.row_arg),
                         bytes(&DrN { n: nv as u32 }),
                     ],
-                    (MAX_VERIFY, 1, 1),
+                    (nv_rows, 1, 1),
                     (1024, 1, 1),
                 )?;
                 e.dispatch(
@@ -733,7 +730,9 @@ impl MetalModel {
                         buf(&dr.s.row_arg),
                         buf(&this.a.tokens),
                         buf(&dr.s.res),
-                        bytes(&DrN { n: DRAFTS as u32 }),
+                        bytes(&DrN {
+                            n: (nv_rows - 1) as u32,
+                        }),
                     ],
                     (1, 1, 1),
                     (1, 1, 1),
@@ -759,7 +758,7 @@ impl MetalModel {
                     }
                     Ok(())
                 })?;
-                this.dr_commit(e, MAX_VERIFY, p0, true)
+                this.dr_commit(e, nv_rows, p0, true)
             });
             self.verify_rows = 0;
             self.last = stats?;
@@ -824,7 +823,7 @@ impl MetalModel {
         let (k0_first, k0_last) = (kc0[..kvd].to_vec(), kc0[(p0 - 1) * kvd..p0 * kvd].to_vec());
         self.a.tokens.write(&[anchor]);
         let this = &*self;
-        this.ctx.run(|e| this.dr_draft(e, p0))?;
+        self.last = this.ctx.run(|e| this.dr_draft(e, p0))?;
         let s = &self.dr().s;
         Ok(DraftDebug {
             k0_first,
@@ -834,5 +833,12 @@ impl MetalModel {
             drafts: s.drafts.as_slice::<u32>()[..DRAFTS].to_vec(),
             fr: s.fr.as_slice::<f32>()[..d].to_vec(),
         })
+    }
+}
+
+impl MetalModel {
+    /// Expert ids of the last layer of the most recent forward, `nt * n_used` (debug only).
+    pub fn debug_last_ids(&self, nt: usize) -> Vec<u32> {
+        self.a.ids.as_slice::<u32>()[..nt * self.hp.n_expert_used].to_vec()
     }
 }

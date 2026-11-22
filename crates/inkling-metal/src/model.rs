@@ -1055,21 +1055,39 @@ impl MetalModel {
             binds.push(buf(segs.get(i).map(|s| s.2).unwrap_or(segs[0].2)));
         }
         binds.push(bytes(&args));
-        if nt == 1 {
-            e.dispatch(
+        self.multi(e, &binds, start as usize, nt, false)
+    }
+
+    /// Dispatches a multi-segment Q8_0 product (binds as for `mv_q8_0_multi`: weights, x, eight
+    /// outputs, MultiArgs with n_tokens set): the matvec up to MAX_VERIFY tokens, where 64-row GEMM
+    /// tiles would leave most of the GPU idle, the GEMM beyond. `f32_tiles` pins exact tiles.
+    fn multi(
+        &self,
+        e: &mut Encoder,
+        binds: &[crate::runtime::Arg],
+        rows: usize,
+        nt: usize,
+        f32_tiles: bool,
+    ) -> Result<()> {
+        if nt <= MAX_VERIFY {
+            return e.dispatch(
                 "mv_q8_0_multi",
-                &binds,
-                ((start as usize).div_ceil(MV_SG), 1, 1),
+                binds,
+                (rows.div_ceil(MV_SG), 1, 1),
                 (32 * MV_SG, 1, 1),
-            )
-        } else {
-            e.dispatch(
-                self.tile("gemm2_q8_0_multi").as_str(),
-                &binds,
-                ((start as usize).div_ceil(GEMM_BM2), nt.div_ceil(GEMM_BN), 1),
-                (128, 1, 1),
-            )
+            );
         }
+        let kernel = if f32_tiles {
+            "gemm2_q8_0_multi_f32".to_string()
+        } else {
+            self.tile("gemm2_q8_0_multi")
+        };
+        e.dispatch(
+            &kernel,
+            binds,
+            (rows.div_ceil(GEMM_BM2), nt.div_ceil(GEMM_BN), 1),
+            (128, 1, 1),
+        )
     }
 
     /// RMS norm of `rows` rows of `n` floats starting at float offset `x_off`.
@@ -1287,7 +1305,7 @@ impl MetalModel {
         let d = self.hp.n_embd;
         let rank = self.hp.loop_gate_rank;
         let a = &self.a;
-        if nt > 1 {
+        if nt > MAX_VERIFY {
             // batch: z = D [rms(x); rms(m)] as GEMMs (the per-token kernels re-read the gate
             // matrices once per token)
             for (src, off, dst_off) in [(x, x_off, 0usize), (m, m_off, d)] {
@@ -1330,8 +1348,9 @@ impl MetalModel {
             d: d as u32,
             rank: rank as u32,
         };
-        self.msg_gate_down(e, g, x, x_off, m, m_off, 0, &ga)?;
-        self.msg_gate_up(e, g, x, x_off, m, m_off, out, out_off, 0, &ga)
+        // decode and short batches: per-token kernels (grid y = token)
+        self.msg_gate_down(e, g, x, x_off, m, m_off, 0, &ga, nt)?;
+        self.msg_gate_up(e, g, x, x_off, m, m_off, out, out_off, 0, &ga, nt)
     }
 
     /// Decode gate, first half: z[z_off..z_off+rank] = D [rms(x); rms(m)].
@@ -1346,6 +1365,7 @@ impl MetalModel {
         m_off: usize,
         z_off: usize,
         ga: &GateArgs,
+        nt: usize,
     ) -> Result<()> {
         e.dispatch(
             "msg_gate_down",
@@ -1356,7 +1376,7 @@ impl MetalModel {
                 buf_at(&self.a.z, z_off * 4),
                 bytes(ga),
             ],
-            (ga.rank as usize, 1, 1),
+            (ga.rank as usize, nt, 1),
             (1024, 1, 1),
         )
     }
@@ -1375,6 +1395,7 @@ impl MetalModel {
         out_off: usize,
         z_off: usize,
         ga: &GateArgs,
+        nt: usize,
     ) -> Result<()> {
         e.dispatch(
             "msg_gate_up",
@@ -1387,7 +1408,7 @@ impl MetalModel {
                 buf_at(out, out_off * 4),
                 bytes(ga),
             ],
-            ((ga.d as usize).div_ceil(MV_SG), 1, 1),
+            ((ga.d as usize).div_ceil(MV_SG), nt, 1),
             (32 * MV_SG, 1, 1),
         )
     }
@@ -1605,7 +1626,7 @@ impl MetalModel {
         }
         if msgs {
             let gates = &self.loops[il - hp.loop_start].gates;
-            if nt == 1 {
+            if nt <= MAX_VERIFY {
                 // the three planes' gates are independent; each gets its own slice of a.z
                 let ga = GateArgs {
                     d: d as u32,
@@ -1621,8 +1642,9 @@ impl MetalModel {
                             j * plane,
                             &a.msgs,
                             j * plane,
-                            j * rank,
+                            j * nt * rank,
                             &ga,
+                            nt,
                         )?;
                     }
                     Ok(())
@@ -1638,8 +1660,9 @@ impl MetalModel {
                             j * plane,
                             &a.inp,
                             j * plane,
-                            j * rank,
+                            j * nt * rank,
                             &ga,
+                            nt,
                         )?;
                     }
                     Ok(())
@@ -1944,12 +1967,7 @@ impl MetalModel {
             let mut binds = vec![buf(&self.w), buf(&a.gate)];
             binds.extend((0..8).map(|_| buf(&a.wo_out)));
             binds.push(bytes(&args));
-            e.dispatch(
-                self.tile("gemm2_q8_0_multi").as_str(),
-                &binds,
-                (d.div_ceil(GEMM_BM2), nt.div_ceil(GEMM_BN), 1),
-                (128, 1, 1),
-            )?;
+            self.multi(e, &binds, d, nt, false)?;
         }
 
         // post-attention conv, fused with the residual bookkeeping: the first layer of a block
@@ -2185,12 +2203,7 @@ impl MetalModel {
             let mut binds = vec![buf(&self.w), buf(&a.n)];
             binds.extend((0..8).map(|_| buf(out)));
             binds.push(bytes(&args));
-            e.dispatch(
-                "gemm2_q8_0_multi_f32",
-                &binds,
-                (hp.n_vocab.div_ceil(GEMM_BM2), nt.div_ceil(GEMM_BN), 1),
-                (128, 1, 1),
-            )?;
+            self.multi(e, &binds, hp.n_vocab, nt, true)?;
             if hp.final_softcap > 0.0 {
                 self.eltwise(
                     e,

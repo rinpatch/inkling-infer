@@ -185,94 +185,6 @@ kernel void conv_step(device const float *x [[buffer(0)]], device float *hist [[
 
 // ---- attention decode --------------------------------------------------------------------------
 
-struct AttnArgs {
-    uint head_dim;    // == threads per threadgroup (128)
-    uint n_head;
-    uint n_kv_head;
-    uint n_rel;
-    uint pos0;        // position of query token 0; token t sits at pos0 + t
-    uint n_swa;       // sliding window, 0 for full attention
-    uint extent;      // relative bias is zero for distance >= extent
-    float scale;
-    uint kv_dim;      // floats per cached position
-};
-
-#define ATTN_CHUNK 128
-
-// Causal attention for T query tokens, one threadgroup per (KV head, token) covering the query
-// heads that share the KV head (GQA), so K and V are read once per group. Keys for all T tokens
-// must already be in the cache. Keys are walked in chunks of ATTN_CHUNK with an online softmax
-// (running max m, sum l, accumulator rescaled when m grows); logits use one simdgroup per key so
-// each key row is one contiguous read; thread c owns output dimension c. The per-query sink logit
-// joins the normalizer at the end and contributes no value.
-// q: [T][n_head][head_dim], r: [T][n_head][n_rel], sinks: [T][n_head], out: [T][n_head][head_dim].
-template <typename KV>
-kernel void attn_flash(device const float *q [[buffer(0)]], device const KV *kc [[buffer(1)]], device const KV *vc [[buffer(2)]],
-                       device const float *r [[buffer(3)]], device const float *rel_bias [[buffer(4)]],
-                       device const float *sinks [[buffer(5)]], device float *out [[buffer(6)]], constant AttnArgs &a [[buffer(7)]],
-                       uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
-    // launched with head_dim threads (the grid is 2-D, so threads_per_threadgroup would have to be too)
-    const uint ntg = a.head_dim;
-    const uint grp = a.n_head / a.n_kv_head;
-    threadgroup float scratch[32];
-    threadgroup float qs[4 * 128];
-    threadgroup float rs[4 * 32];
-    threadgroup float lg_t[4][ATTN_CHUNK];
-    uint kvh = tg.x, t = tg.y;
-    uint pos = a.pos0 + t;
-    uint first = (a.n_swa && pos + 1 > a.n_swa) ? pos + 1 - a.n_swa : 0;
-    for (uint g = 0; g < grp; ++g) {
-        uint h = kvh * grp + g;
-        for (uint i = tid; i < a.head_dim; i += ntg) qs[g * a.head_dim + i] = q[((ulong)t * a.n_head + h) * a.head_dim + i];
-        for (uint i = tid; i < a.n_rel; i += ntg) rs[g * a.n_rel + i] = r[((ulong)t * a.n_head + h) * a.n_rel + i];
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    uint sg = tid / 32, lane = tid % 32, nsg = ntg / 32;
-    float m[4], l[4], acc[4];
-    for (uint g = 0; g < grp; ++g) { m[g] = -INFINITY; l[g] = 0.0f; acc[g] = 0.0f; }
-    for (uint j0 = first; j0 <= pos; j0 += ATTN_CHUNK) {
-        uint n = min((uint)ATTN_CHUNK, pos + 1 - j0);
-        for (uint kk = sg; kk < n; kk += nsg) {
-            uint j = j0 + kk;
-            float4 kv = float4(((device const vec<KV, 4> *)(kc + (ulong)j * a.kv_dim + kvh * a.head_dim))[lane]);
-            uint dist = pos - j;
-            for (uint g = 0; g < grp; ++g) {
-                float d = simd_sum(dot(((threadgroup const float4 *)(qs + g * a.head_dim))[lane], kv));
-                float bias = (dist < a.extent && lane < a.n_rel) ? rs[g * a.n_rel + lane] * rel_bias[dist * a.n_rel + lane] : 0.0f;
-                bias = simd_sum(bias);
-                if (lane == 0) lg_t[g][kk] = d * a.scale + bias;
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint g = 0; g < grp; ++g) {
-            float lg = tid < n ? lg_t[g][tid] : -INFINITY;
-            float m_new = max(m[g], tg_max(lg, scratch, tid, ntg));
-            float p = tid < n ? exp(lg - m_new) : 0.0f;
-            float corr = exp(m[g] - m_new);
-            l[g] = l[g] * corr + tg_sum(p, scratch, tid, ntg);
-            acc[g] *= corr;
-            m[g] = m_new;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            lg_t[g][tid] = p;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        device const KV *vp = vc + (ulong)j0 * a.kv_dim + kvh * a.head_dim + tid;
-        for (uint jj = 0; jj < n; ++jj) {
-            float v = float(vp[(ulong)jj * a.kv_dim]);
-            for (uint g = 0; g < grp; ++g) acc[g] += lg_t[g][jj] * v;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    for (uint g = 0; g < grp; ++g) {
-        uint h = kvh * grp + g;
-        float sink = sinks[(ulong)t * a.n_head + h];
-        float mf = max(m[g], sink);
-        float total = l[g] * exp(m[g] - mf) + exp(sink - mf);
-        out[((ulong)t * a.n_head + h) * a.head_dim + tid] = acc[g] * exp(m[g] - mf) / total;
-    }
-}
-
 // ---- elementwise -------------------------------------------------------------------------------
 
 struct NArgs {
@@ -369,6 +281,7 @@ kernel void rms_norm_strided(device const float *x [[buffer(0)]], device float *
 // all the query heads that share it (GQA), writes partial (max, sum, accumulator) results, and
 // attn_combine merges the blocks per head, adding the sink logit.
 
+#define ATTN_CHUNK 128  // keys per online-softmax step
 #define ATTN_SPLIT 256
 #define ATTN_MAX_GRP 4
 
@@ -541,11 +454,180 @@ template [[host_name("conv_head_f16")]] kernel void conv_head<half>(device const
                                                                      device const float *, device half *, constant ConvHeadArgs &, uint, uint);
 
 #define ATTN_INSTANCES(KV, name)                                                                                                        \
-    template [[host_name("attn_flash_" name)]] kernel void attn_flash<KV>(device const float *, device const KV *, device const KV *,     \
-                                                                         device const float *, device const float *, device const float *, \
-                                                                         device float *, constant AttnArgs &, uint2, uint);                \
     template [[host_name("attn_split_" name)]] kernel void attn_split<KV>(device const float *, device const KV *, device const KV *,     \
                                                                          device const float *, device const float *, device float *,       \
                                                                          device float *, device float *, constant SplitArgs &, uint2, uint);
 ATTN_INSTANCES(float, "f32")
 ATTN_INSTANCES(half, "f16")
+
+// ---- prefill attention, query-tiled ------------------------------------------------------------
+// Design follows mlx-lm's fused Inkling kernel (mlx_lm/models/inkling2/kernels.py,
+// relative_attention): 32 queries per threadgroup (8 per simdgroup), keys in blocks of 16, scores
+// and P.V on simdgroup 8x8 matrices with f32 accumulation, the relative bias looked up from a
+// per-(token, head) table by distance, and the sink logit as the start of each row's online
+// softmax. Each K/V block load serves 32 queries instead of one.
+
+struct RelTableArgs {
+    uint n_rows;   // n_tokens * n_head
+    uint n_rel;
+    uint extent;
+};
+
+// table[row][dist] = r[row] . rel_bias[dist] for dist < extent. Grid: (ceil(extent/256), n_rows).
+kernel void rel_table(device const float *r [[buffer(0)]], device const float *rel_bias [[buffer(1)]], device float *table [[buffer(2)]],
+                      constant RelTableArgs &a [[buffer(3)]], uint2 gid [[thread_position_in_grid]]) {
+    uint dist = gid.x, row = gid.y;
+    if (dist >= a.extent || row >= a.n_rows) return;
+    device const float *rr = r + (ulong)row * a.n_rel;
+    device const float *bt = rel_bias + (ulong)dist * a.n_rel;
+    float s = 0.0f;
+    for (uint i = 0; i < a.n_rel; ++i) s += rr[i] * bt[i];
+    table[(ulong)row * a.extent + dist] = s;
+}
+
+struct TiledArgs {
+    uint n_tokens;
+    uint n_head;
+    uint n_kv_head;
+    uint pos0;      // position of query token 0 (keys are cached at their positions)
+    uint n_swa;     // 0 for full attention
+    uint extent;    // bias table length; bias is 0 for distance >= extent
+    float scale;
+    uint kv_dim;
+};
+
+#define TQ 32
+#define TK 16
+#define THD 128
+
+// Grid: (ceil(n_tokens/TQ), n_head), 128 threads. C: tile/fragment compute type (float or half).
+template <typename KV, typename C>
+kernel void attn_tiled(device const float *q [[buffer(0)]], device const KV *kc [[buffer(1)]], device const KV *vc [[buffer(2)]],
+                       device const float *bias_tab [[buffer(3)]], device const float *sinks [[buffer(4)]], device float *out [[buffer(5)]],
+                       constant TiledArgs &a [[buffer(6)]], uint2 tg [[threadgroup_position_in_grid]],
+                       uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
+                       uint lane [[thread_index_in_simdgroup]]) {
+    typedef typename metal::conditional<metal::is_same<C, half>::value, simdgroup_half8x8, simdgroup_float8x8>::type Mat;
+    constexpr uint LDK = TK + 8;
+    constexpr uint LDV = THD + 8;
+    threadgroup C Ks[THD * LDK];  // K block transposed: Ks[dim][key]
+    threadgroup C Vs[TK * LDV];   // V block: Vs[key][dim]
+
+    const uint h = tg.y;
+    const uint kvh = h / (a.n_head / a.n_kv_head);
+    const uint q0 = tg.x * TQ;
+    // lane holds row fm and columns fn, fn+1 of each 8x8 fragment (Apple simdgroup layout)
+    const ushort fm = ((lane / 4) & 4) + (lane / 2) % 4;
+    const ushort fn = ((lane / 4) & 2) * 2 + (lane % 2) * 2;
+    const uint row = q0 + sg * 8 + fm;
+    const bool row_ok = row < a.n_tokens;
+    const uint diag = a.pos0 + row;  // this query's position
+
+    Mat q_frag[THD / 8];
+    for (uint db = 0; db < THD / 8; ++db) {
+        float2 qv = float2(0.0f);
+        if (row_ok) {
+            device const float *qp = q + ((ulong)row * a.n_head + h) * THD + db * 8 + fn;
+            qv = float2(qp[0], qp[1]) * a.scale;
+        }
+        q_frag[db].thread_elements()[0] = C(qv.x);
+        q_frag[db].thread_elements()[1] = C(qv.y);
+    }
+    simdgroup_float8x8 acc[THD / 8];
+    for (uint db = 0; db < THD / 8; ++db) acc[db] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    float row_max = row_ok ? sinks[(ulong)row * a.n_head + h] : 0.0f;
+    float row_sum = 1.0f;  // the sink's exp(sink - row_max) with row_max = sink
+    device const float *bias = bias_tab + ((ulong)(row_ok ? row : 0) * a.n_head + h) * a.extent;
+
+    const uint last = a.pos0 + min(q0 + TQ, a.n_tokens) - 1;
+    const uint first_pos = a.pos0 + q0;
+    uint first_key = (a.n_swa && first_pos + 1 > a.n_swa) ? first_pos + 1 - a.n_swa : 0;
+    device const KV *k_head = kc + kvh * THD;
+    device const KV *v_head = vc + kvh * THD;
+
+    for (uint k0 = first_key / TK * TK; k0 <= last; k0 += TK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint c = tid; c < TK * THD / 4; c += 128) {
+            uint r = c / (THD / 4), col = (c % (THD / 4)) * 4;
+            uint key = k0 + r;
+            float4 kv = float4(0), vv = float4(0);
+            if (key <= last) {
+                kv = float4(*(device const vec<KV, 4> *)(k_head + (ulong)key * a.kv_dim + col));
+                vv = float4(*(device const vec<KV, 4> *)(v_head + (ulong)key * a.kv_dim + col));
+            }
+            for (uint j = 0; j < 4; ++j) {
+                Ks[(col + j) * LDK + r] = C(kv[j]);
+                Vs[r * LDV + col + j] = C(vv[j]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (q0 + sg * 8 >= a.n_tokens) continue;
+
+        simdgroup_float8x8 scores[TK / 8];
+        for (uint kb = 0; kb < TK / 8; ++kb) {
+            scores[kb] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            for (uint db = 0; db < THD / 8; ++db) {
+                Mat k_frag;
+                simdgroup_load(k_frag, Ks + db * 8 * LDK + kb * 8, LDK);
+                simdgroup_multiply_accumulate(scores[kb], q_frag[db], k_frag, scores[kb]);
+            }
+        }
+        float tile_max = -INFINITY;
+        for (uint kb = 0; kb < TK / 8; ++kb) {
+            for (uint e = 0; e < 2; ++e) {
+                uint key = k0 + kb * 8 + fn + e;
+                bool visible = row_ok && key <= diag && (a.n_swa == 0 || diag - key < a.n_swa);
+                float s = -INFINITY;
+                if (visible) {
+                    uint d = diag - key;
+                    s = scores[kb].thread_elements()[e] + (d < a.extent ? bias[d] : 0.0f);
+                }
+                scores[kb].thread_elements()[e] = s;
+                tile_max = max(tile_max, s);
+            }
+        }
+        // the 4 lanes of a row are lane^1 and lane^8 apart
+        tile_max = max(tile_max, simd_shuffle_xor(tile_max, 1));
+        tile_max = max(tile_max, simd_shuffle_xor(tile_max, 8));
+        float new_max = max(row_max, tile_max);
+        float factor = exp(row_max - new_max);
+        float tile_sum = 0.0f;
+        Mat probs[TK / 8];
+        for (uint kb = 0; kb < TK / 8; ++kb) {
+            for (uint e = 0; e < 2; ++e) {
+                float p = exp(scores[kb].thread_elements()[e] - new_max);
+                probs[kb].thread_elements()[e] = C(p);
+                tile_sum += p;
+            }
+        }
+        tile_sum += simd_shuffle_xor(tile_sum, 1);
+        tile_sum += simd_shuffle_xor(tile_sum, 8);
+        row_sum = row_sum * factor + tile_sum;
+        row_max = new_max;
+        for (uint db = 0; db < THD / 8; ++db) {
+            acc[db].thread_elements()[0] *= factor;
+            acc[db].thread_elements()[1] *= factor;
+            for (uint kb = 0; kb < TK / 8; ++kb) {
+                Mat v_frag;
+                simdgroup_load(v_frag, Vs + kb * 8 * LDV + db * 8, LDV);
+                simdgroup_multiply_accumulate(acc[db], probs[kb], v_frag, acc[db]);
+            }
+        }
+    }
+    if (row_ok) {
+        device float *op = out + ((ulong)row * a.n_head + h) * THD;
+        for (uint db = 0; db < THD / 8; ++db) {
+            op[db * 8 + fn] = acc[db].thread_elements()[0] / row_sum;
+            op[db * 8 + fn + 1] = acc[db].thread_elements()[1] / row_sum;
+        }
+    }
+}
+
+#define TILED_INSTANCE(KV, C, name)                                                                                                     \
+    template [[host_name("attn_tiled_" name)]] kernel void attn_tiled<KV, C>(device const float *, device const KV *, device const KV *, \
+                                                                            device const float *, device const float *, device float *, \
+                                                                            constant TiledArgs &, uint2, uint, uint, uint);
+TILED_INSTANCE(float, float, "kv32_f32")
+TILED_INSTANCE(half, float, "kv16_f32")
+TILED_INSTANCE(float, half, "kv32_f16")
+TILED_INSTANCE(half, half, "kv16_f16")

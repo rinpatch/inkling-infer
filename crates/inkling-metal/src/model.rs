@@ -90,19 +90,6 @@ enum Second<'b> {
 }
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct AttnArgs {
-    head_dim: u32,
-    n_head: u32,
-    n_kv_head: u32,
-    n_rel: u32,
-    pos0: u32,
-    n_swa: u32,
-    extent: u32,
-    scale: f32,
-    kv_dim: u32,
-}
-#[repr(C)]
-#[derive(Clone, Copy)]
 struct SplitArgs {
     head_dim: u32,
     n_head: u32,
@@ -126,6 +113,28 @@ struct CombineAttnArgs {
 /// 32 keys at short context so at least ~64 threadgroups run.
 const ATTN_SPLIT: usize = 256;
 const ATTN_SPLIT_MIN: usize = 32;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RelTableArgs {
+    n_rows: u32,
+    n_rel: u32,
+    extent: u32,
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct TiledArgs {
+    n_tokens: u32,
+    n_head: u32,
+    n_kv_head: u32,
+    pos0: u32,
+    n_swa: u32,
+    extent: u32,
+    scale: f32,
+    kv_dim: u32,
+}
+/// Queries per threadgroup in attn_tiled (kernels/layer.metal TQ).
+const ATTN_TQ: usize = 32;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -310,6 +319,7 @@ struct Act {
     att_m: Buffer,   // [n_head][n_split] decode-attention partial maxima
     att_l: Buffer,   // [n_head][n_split] partial sums
     att_acc: Buffer, // [n_head][n_split][head_dim] partial accumulators
+    rel_tab: Buffer, // [nt][n_head][extent] relative-bias table for prefill attention
     gin: Buffer,     // [nt][2d] normalized gate inputs
     gf: Buffer,      // [nt][d] forget logits
     gg: Buffer,      // [nt][d] gain logits
@@ -379,15 +389,17 @@ fn opt(g: &Gguf, name: &str, want: DType) -> Result<Option<T>> {
 /// Construction options.
 #[derive(Debug, Clone, Copy)]
 pub struct Options {
-    /// Store the KV cache as f16 (half the cache traffic) instead of f32. Default: on unless
-    /// INKLING_KV_F32 is set. Traces of Kcur/Vcur are only available with an f32 cache.
+    /// Store the KV cache as f16 (half the memory) instead of f32. Opt-in (INKLING_KV_F16=1): it is
+    /// accurate (identical attention outputs for identical values), but its rounding perturbs
+    /// near-tied MoE routing decisions, so the exact prefill-vs-decode and single-position checks
+    /// stop being bit-faithful. Kcur/Vcur traces need an f32 cache.
     pub kv_f16: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
         Options {
-            kv_f16: std::env::var_os("INKLING_KV_F32").is_none(),
+            kv_f16: std::env::var_os("INKLING_KV_F16").is_some(),
         }
     }
 }
@@ -544,6 +556,7 @@ impl MetalModel {
             att_m: nb(hp.n_head * max_ctx.div_ceil(ATTN_SPLIT_MIN))?,
             att_l: nb(hp.n_head * max_ctx.div_ceil(ATTN_SPLIT_MIN))?,
             att_acc: nb(hp.n_head * max_ctx.div_ceil(ATTN_SPLIT_MIN) * hp.head_dim)?,
+            rel_tab: nb(ub * hp.n_head * hp.rel_extent.max(hp.n_swa))?,
             gin: nb(ub * 2 * d)?,
             gf: nb(ub * d)?,
             gg: nb(ub * d)?,
@@ -583,6 +596,12 @@ impl MetalModel {
                 _ => true,
             };
         format!("{base}_{}", if f16 { "f16" } else { "f32" })
+    }
+
+    /// Raw K-cache bytes of `slot` for the first `n` positions (diagnostics).
+    #[doc(hidden)]
+    pub fn debug_k_cache(&self, slot: usize, n: usize) -> Vec<u8> {
+        self.slots[slot].k.as_slice::<u8>()[..n * self.hp.kv_dim() * self.kv_bytes()].to_vec()
     }
 
     fn kv_bytes(&self) -> usize {
@@ -1520,25 +1539,40 @@ impl MetalModel {
             )?;
             rec(e, "kqv_out", s, &a.o, 0, qd)?;
         } else {
+            // prefill: relative-bias table per (token, head), then query-tiled attention
             e.dispatch(
-                if self.kv_f16 {
-                    "attn_flash_f16"
-                } else {
-                    "attn_flash_f32"
-                },
+                "rel_table",
+                &[
+                    buf(&a.r),
+                    buf_at(&self.w, lw.rel_bias.0),
+                    buf(&a.rel_tab),
+                    bytes(&RelTableArgs {
+                        n_rows: (nt * nh) as u32,
+                        n_rel: nr as u32,
+                        extent: lw.rel_extent as u32,
+                    }),
+                ],
+                (lw.rel_extent.div_ceil(256), nt * nh, 1),
+                (256, 1, 1),
+            )?;
+            let kernel = format!(
+                "attn_tiled_{}_{}",
+                if self.kv_f16 { "kv16" } else { "kv32" },
+                if self.exact_prefill { "f32" } else { "f16" }
+            );
+            e.dispatch(
+                &kernel,
                 &[
                     buf(&a.q),
                     buf(&slot.k),
                     buf(&slot.v),
-                    buf(&a.r),
-                    buf_at(&self.w, lw.rel_bias.0),
+                    buf(&a.rel_tab),
                     buf(&a.sinks),
                     buf(&a.o),
-                    bytes(&AttnArgs {
-                        head_dim: hd as u32,
+                    bytes(&TiledArgs {
+                        n_tokens: nt as u32,
                         n_head: nh as u32,
                         n_kv_head: nkv as u32,
-                        n_rel: nr as u32,
                         pos0: self.pos as u32,
                         n_swa: if lw.is_swa { hp.n_swa as u32 } else { 0 },
                         extent: lw.rel_extent as u32,
@@ -1546,8 +1580,8 @@ impl MetalModel {
                         kv_dim: kvd as u32,
                     }),
                 ],
-                (nkv, nt, 1),
-                (hd, 1, 1),
+                (nt.div_ceil(ATTN_TQ), nh, 1),
+                (128, 1, 1),
             )?;
             rec(e, "kqv_out", s, &a.o, 0, qd)?;
             // gate <- o * sigmoid(gate)

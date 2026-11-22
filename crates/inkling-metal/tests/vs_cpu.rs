@@ -164,6 +164,20 @@ fn swa_tokens(n: usize) -> Option<Vec<u32>> {
 /// same last-token logits, and the same logits for the tokens decoded afterwards.
 #[test]
 fn prefill_matches_token_by_token_decode() {
+    prefill_vs_decode(false);
+}
+
+/// Same check with an f16 KV cache on both sides. Not a valid exactness test: f16 rounding of the
+/// cache perturbs near-tied router scores (e.g. layer 12, pass 2: 8th vs 9th expert 3.4e-5 apart,
+/// router_margin_at_drift_point), and one flipped expert moves a token's output by ~4%. The
+/// kernels themselves agree exactly on identical values (tests/attn_kernel.rs).
+#[test]
+#[ignore = "fails on legitimate near-tie routing flips; kept to show the effect"]
+fn prefill_matches_decode_with_f16_kv() {
+    prefill_vs_decode(true);
+}
+
+fn prefill_vs_decode(kv_f16: bool) {
     let Some(mp) = model_path() else {
         eprintln!("SKIP: model not found");
         return;
@@ -177,17 +191,16 @@ fn prefill_matches_token_by_token_decode() {
     for n_prompt in [7usize, 300, 600] {
         let (prompt, rest) = (&all[..n_prompt], &all[n_prompt..n_prompt + 5]);
         let mut batched =
-            MetalModel::with_options(&g, hp.clone(), 700, Options { kv_f16: false }).unwrap();
+            MetalModel::with_options(&g, hp.clone(), 700, Options { kv_f16 }).unwrap();
         batched.exact_prefill = true;
-        let mut serial =
-            MetalModel::with_options(&g, hp.clone(), 700, Options { kv_f16: false }).unwrap();
+        let mut serial = MetalModel::with_options(&g, hp.clone(), 700, Options { kv_f16 }).unwrap();
         let mut lb = batched.prefill(prompt).unwrap();
         let mut ls = Vec::new();
         for &t in prompt {
             ls = serial.step(t, &mut inkling::NoTrace).unwrap();
         }
         let e = rel_l2(&lb, &ls);
-        println!("{n_prompt} prompt tokens: last-token logits rel_l2 {e:.2e}");
+        println!("kv_f16={kv_f16}, {n_prompt} prompt tokens: last-token logits rel_l2 {e:.2e}");
         assert!(
             e < 1e-3,
             "prefill of {n_prompt} tokens diverges from decode: {e:.2e}"
@@ -273,5 +286,153 @@ fn fast_prefill_keeps_next_token_distribution() {
                 ls = serial.step(rest[step], &mut inkling::NoTrace).unwrap();
             }
         }
+    }
+}
+
+/// Diagnostic: how far do f16-cache prefill and f16-cache decode each move from their f32-cache
+/// versions? Plain f16 rounding of keys and values should cost ~1e-3 relative.
+#[test]
+#[ignore = "diagnostic"]
+fn f16_kv_drift_per_path() {
+    let Some(mp) = model_path() else { return };
+    let Some(all) = swa_tokens(64) else { return };
+    let g = gguf::Gguf::open(mp).unwrap();
+    let hp = Hparams::from_gguf(&g).unwrap();
+    let prompt = &all[..7];
+    let mk = |kv_f16| MetalModel::with_options(&g, hp.clone(), 128, Options { kv_f16 }).unwrap();
+    let (mut p16, mut p32) = (mk(true), mk(false));
+    let e_prefill = rel_l2(&p16.prefill(prompt).unwrap(), &p32.prefill(prompt).unwrap());
+    let (mut d16, mut d32) = (mk(true), mk(false));
+    let (mut l16, mut l32) = (Vec::new(), Vec::new());
+    for &t in prompt {
+        l16 = d16.step(t, &mut inkling::NoTrace).unwrap();
+        l32 = d32.step(t, &mut inkling::NoTrace).unwrap();
+    }
+    println!(
+        "prefill f16 vs f32 cache: {e_prefill:.2e}; decode f16 vs f32 cache: {:.2e}",
+        rel_l2(&l16, &l32)
+    );
+    // per-slot K cache drift between the f16- and f32-cache prefills (pure rounding: ~3e-4)
+    for slot in (0usize..48).collect::<Vec<_>>() {
+        let a = p16.debug_k_cache(slot, prompt.len());
+        let b = p32.debug_k_cache(slot, prompt.len());
+        let fa: Vec<f32> = a
+            .chunks(2)
+            .map(|c| half_to_f32(u16::from_le_bytes([c[0], c[1]])))
+            .collect();
+        let fb: Vec<f32> = b
+            .chunks(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        println!(
+            "slot {slot:2}: K rel diff f16-cache vs f32-cache prefill {:.2e}",
+            rel_l2(&fa, &fb)
+        );
+    }
+    // per-position breakdown at the slot where the drift jumps (a routing flip would hit one token)
+    for slot in [30usize, 31] {
+        let a = p16.debug_k_cache(slot, prompt.len());
+        let b = p32.debug_k_cache(slot, prompt.len());
+        let fa: Vec<f32> = a
+            .chunks(2)
+            .map(|c| half_to_f32(u16::from_le_bytes([c[0], c[1]])))
+            .collect();
+        let fb: Vec<f32> = b
+            .chunks(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let kvd = hp.kv_dim();
+        let per: Vec<String> = (0..prompt.len())
+            .map(|t| {
+                format!(
+                    "{:.1e}",
+                    rel_l2(&fa[t * kvd..(t + 1) * kvd], &fb[t * kvd..(t + 1) * kvd])
+                )
+            })
+            .collect();
+        println!("slot {slot} per position: {}", per.join(" "));
+    }
+    // compare the f16 K cache written by prefill with the one written by token-by-token decode
+    for slot in [0usize, 5, 30, 47] {
+        let a = p16.debug_k_cache(slot, prompt.len());
+        let b = d16.debug_k_cache(slot, prompt.len());
+        let diff = a.chunks(2).zip(b.chunks(2)).filter(|(x, y)| x != y).count();
+        println!(
+            "slot {slot}: {diff} of {} f16 K values differ between prefill and decode",
+            a.len() / 2
+        );
+        let h = |c: &[u8]| half_to_f32(u16::from_le_bytes([c[0], c[1]]));
+        let mut worst = (0usize, 0.0f32, 0.0f32);
+        for (i, (x, y)) in a.chunks(2).zip(b.chunks(2)).enumerate() {
+            let (fx, fy) = (h(x), h(y));
+            if (fx - fy).abs() > (worst.1 - worst.2).abs() {
+                worst = (i, fx, fy);
+            }
+        }
+        let kvd = hp.kv_dim();
+        println!(
+            "   worst: position {} channel {}: prefill {} vs decode {}",
+            worst.0 / kvd,
+            worst.0 % kvd,
+            worst.1,
+            worst.2
+        );
+    }
+}
+
+fn half_to_f32(h: u16) -> f32 {
+    let s = (h >> 15) as u32;
+    let e = ((h >> 10) & 0x1f) as i32;
+    let m = (h & 0x3ff) as f32;
+    let v = if e == 0 {
+        m * 2f32.powi(-24)
+    } else if e == 31 {
+        f32::INFINITY
+    } else {
+        (1.0 + m / 1024.0) * 2f32.powi(e - 15)
+    };
+    if s == 1 { -v } else { v }
+}
+
+struct RouterAt(usize, Vec<f32>);
+impl Trace for RouterAt {
+    fn wants(&self, name: &str, slot: Option<usize>) -> bool {
+        name == "ffn_moe_logits" && slot == Some(self.0)
+    }
+    fn record(&mut self, _: &str, _: Option<usize>, data: &[f32]) {
+        self.1 = data.to_vec();
+    }
+}
+
+/// Diagnostic: router selection margin (8th vs 9th expert score) at slot 30 (layer 12, pass 2) for
+/// the token where the f16-cache drift jumps, with an f16 and an f32 cache.
+#[test]
+#[ignore = "diagnostic"]
+fn router_margin_at_drift_point() {
+    let Some(mp) = model_path() else { return };
+    let Some(all) = swa_tokens(64) else { return };
+    let g = gguf::Gguf::open(mp).unwrap();
+    let hp = Hparams::from_gguf(&g).unwrap();
+    let bias = g.to_f32(g.tensor("blk.12.exp_probs_b.bias").unwrap());
+    for kv_f16 in [false, true] {
+        let mut m = MetalModel::with_options(&g, hp.clone(), 128, Options { kv_f16 }).unwrap();
+        let mut r = RouterAt(30, Vec::new());
+        for &t in &all[..7] {
+            r.1.clear();
+            m.step(t, &mut r).unwrap();
+        }
+        let mut sc: Vec<(usize, f32)> =
+            r.1.iter()
+                .enumerate()
+                .map(|(e, &l)| (e, 1.0 / (1.0 + (-l).exp()) + bias[e]))
+                .collect();
+        sc.sort_by(|a, b| b.1.total_cmp(&a.1));
+        println!(
+            "kv_f16={kv_f16}: 8th {:?} 9th {:?} margin {:.2e}; top8 {:?}",
+            sc[7],
+            sc[8],
+            sc[7].1 - sc[8].1,
+            sc[..8].iter().map(|x| x.0).collect::<Vec<_>>()
+        );
     }
 }

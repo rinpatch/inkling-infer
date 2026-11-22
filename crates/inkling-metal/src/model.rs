@@ -101,6 +101,7 @@ struct SplitArgs {
     scale: f32,
     kv_dim: u32,
     n_split: u32,
+    split: u32,
 }
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -108,8 +109,10 @@ struct CombineAttnArgs {
     head_dim: u32,
     n_split: u32,
 }
-/// Keys per decode-attention block (kernels/layer.metal ATTN_SPLIT).
+/// Largest keys-per-block in decode attention (kernels/layer.metal ATTN_SPLIT); blocks shrink to
+/// 32 keys at short context so at least ~64 threadgroups run.
 const ATTN_SPLIT: usize = 256;
+const ATTN_SPLIT_MIN: usize = 32;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -500,9 +503,9 @@ impl MetalModel {
             grp_offset: nb(hp.n_expert)?,
             grp_pairs: nb(ub * hp.n_expert_used)?,
             yp: nb(ub * hp.n_expert_used * d)?,
-            att_m: nb(hp.n_head * max_ctx.div_ceil(ATTN_SPLIT))?,
-            att_l: nb(hp.n_head * max_ctx.div_ceil(ATTN_SPLIT))?,
-            att_acc: nb(hp.n_head * max_ctx.div_ceil(ATTN_SPLIT) * hp.head_dim)?,
+            att_m: nb(hp.n_head * max_ctx.div_ceil(ATTN_SPLIT_MIN))?,
+            att_l: nb(hp.n_head * max_ctx.div_ceil(ATTN_SPLIT_MIN))?,
+            att_acc: nb(hp.n_head * max_ctx.div_ceil(ATTN_SPLIT_MIN) * hp.head_dim)?,
             gin: nb(ub * 2 * d)?,
             gf: nb(ub * d)?,
             gg: nb(ub * d)?,
@@ -1397,7 +1400,12 @@ impl MetalModel {
             } else {
                 0
             };
-            let n_split = (self.pos + 1 - first).div_ceil(ATTN_SPLIT);
+            let n_keys = self.pos + 1 - first;
+            let split = n_keys
+                .div_ceil(64 / nkv)
+                .next_multiple_of(32)
+                .clamp(ATTN_SPLIT_MIN, ATTN_SPLIT);
+            let n_split = n_keys.div_ceil(split);
             e.dispatch(
                 "attn_split",
                 &[
@@ -1420,6 +1428,7 @@ impl MetalModel {
                         scale: 1.0 / (hd as f32).sqrt(),
                         kv_dim: kvd as u32,
                         n_split: n_split as u32,
+                        split: split as u32,
                     }),
                 ],
                 (nkv, n_split, 1),

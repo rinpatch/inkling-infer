@@ -77,42 +77,55 @@ struct MixArgs {
 #define MIX_MAX_Q 4
 
 // out[q] = sum_s softmax_s(q . rms(S_s) / sqrt(d)) * rms(S_s), S = [blocks..., cur]. One threadgroup.
-// Grid: one threadgroup per token.
+// Grid: one threadgroup per token. All partial sums (|S_s|^2 and q.S_s for every query) are
+// accumulated in one pass and reduced together, instead of one barrier-heavy reduction each.
 kernel void depth_mix(device const float *blocks [[buffer(0)]], device const float *cur [[buffer(1)]],
                       device const float *queries [[buffer(2)]], device float *out [[buffer(3)]], constant MixArgs &a [[buffer(4)]],
                       uint t [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]],
                       uint ntg [[threads_per_threadgroup]]) {
-    threadgroup float scratch[32];
+    // value v: ss[s] = v (s < ns), dot[q][s] = ns + q*ns + s
+    threadgroup float part[32][MIX_MAX_STATES * (MIX_MAX_Q + 1)];
+    threadgroup float inv_rms[MIX_MAX_STATES];
+    threadgroup float p[MIX_MAX_Q][MIX_MAX_STATES];
     blocks += (ulong)t * a.d;
     cur += (ulong)t * a.d;
     out += (ulong)t * a.d;
-    threadgroup float inv_rms[MIX_MAX_STATES];
-    threadgroup float p[MIX_MAX_Q][MIX_MAX_STATES];
     uint ns = a.n_blocks + 1;
+    uint nv = ns * (a.n_q + 1);
 #define state(s) ((s) < a.n_blocks ? blocks + (ulong)(s) * a.plane : cur)
 
-    for (uint s = 0; s < ns; ++s) {
-        device const float *x = state(s);
-        float ss = 0.0f;
-        for (uint i = tid; i < a.d; i += ntg) ss += x[i] * x[i];
-        float t = tg_sum(ss, scratch, tid, ntg);
-        if (tid == 0) inv_rms[s] = rsqrt(t / a.d + 1e-6f);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint q = 0; q < a.n_q; ++q) {
+    float acc[MIX_MAX_STATES * (MIX_MAX_Q + 1)];
+    for (uint v = 0; v < nv; ++v) acc[v] = 0.0f;
+    for (uint i = tid; i < a.d; i += ntg) {
+        float qv[MIX_MAX_Q];
+        for (uint q = 0; q < a.n_q; ++q) qv[q] = queries[q * a.d + i];
         for (uint s = 0; s < ns; ++s) {
-            device const float *x = state(s);
-            device const float *w = queries + q * a.d;
-            float acc = 0.0f;
-            for (uint i = tid; i < a.d; i += ntg) acc += x[i] * w[i];
-            float t = tg_sum(acc, scratch, tid, ntg);
-            if (tid == 0) p[q][s] = t * inv_rms[s] * rsqrt(float(a.d));
+            float x = state(s)[i];
+            acc[s] += x * x;
+            for (uint q = 0; q < a.n_q; ++q) acc[ns + q * ns + s] += x * qv[q];
         }
     }
+    uint sg = tid / 32, lane = tid % 32, nsg = (ntg + 31) / 32;
+    for (uint v = 0; v < nv; ++v) {
+        float r = simd_sum(acc[v]);
+        if (lane == 0) part[sg][v] = r;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < nv) {
+        float r = 0.0f;
+        for (uint k = 0; k < nsg; ++k) r += part[k][tid];
+        part[0][tid] = r;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < ns) inv_rms[tid] = rsqrt(part[0][tid] / a.d + 1e-6f);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid < a.n_q) {
+        float sc = rsqrt(float(a.d));
         float m = -INFINITY;
-        for (uint s = 0; s < ns; ++s) m = max(m, p[tid][s]);
+        for (uint s = 0; s < ns; ++s) {
+            p[tid][s] = part[0][ns + tid * ns + s] * inv_rms[s] * sc;
+            m = max(m, p[tid][s]);
+        }
         float sum = 0.0f;
         for (uint s = 0; s < ns; ++s) { p[tid][s] = exp(p[tid][s] - m); sum += p[tid][s]; }
         for (uint s = 0; s < ns; ++s) p[tid][s] /= sum;
@@ -120,9 +133,9 @@ kernel void depth_mix(device const float *blocks [[buffer(0)]], device const flo
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint i = tid; i < a.d; i += ntg) {
         for (uint q = 0; q < a.n_q; ++q) {
-            float acc = 0.0f;
-            for (uint s = 0; s < ns; ++s) acc += p[q][s] * inv_rms[s] * state(s)[i];
-            out[(ulong)q * a.plane + i] = acc;
+            float o = 0.0f;
+            for (uint s = 0; s < ns; ++s) o += p[q][s] * inv_rms[s] * state(s)[i];
+            out[(ulong)q * a.plane + i] = o;
         }
     }
 #undef state
@@ -368,7 +381,8 @@ struct SplitArgs {
     uint extent;
     float scale;
     uint kv_dim;
-    uint n_split;     // blocks of ATTN_SPLIT keys covering [first, pos]
+    uint n_split;     // blocks of `split` keys covering [first, pos]
+    uint split;       // keys per block (multiple of 32, at most ATTN_SPLIT)
 };
 
 // Grid: (n_kv_head, n_split), head_dim threads. Partials: pm/pl [n_head][n_split], pacc [n_head][n_split][head_dim].
@@ -390,8 +404,8 @@ kernel void attn_split(device const float *q [[buffer(0)]], device const float *
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    uint lo = a.first + s * ATTN_SPLIT;
-    uint hi = min(lo + ATTN_SPLIT, a.pos + 1);
+    uint lo = a.first + s * a.split;
+    uint hi = min(lo + a.split, a.pos + 1);
     float m[ATTN_MAX_GRP], l[ATTN_MAX_GRP], acc[ATTN_MAX_GRP];
     for (uint g = 0; g < grp; ++g) { m[g] = -INFINITY; l[g] = 0.0f; acc[g] = 0.0f; }
     threadgroup float lg_t[ATTN_MAX_GRP][ATTN_CHUNK];

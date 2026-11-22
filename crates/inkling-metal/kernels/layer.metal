@@ -764,3 +764,91 @@ kernel void argmax_token(device const float *logits [[buffer(0)]], device uint *
         if (lane == 0) { tokens[0] = idx; out[a.out_index] = idx; }
     }
 }
+
+// ---- short convolutions over a batch, token-parallel ---------------------------------------------
+// A short conv has no recurrence: token t's output reads only the inputs at t-nc+1..t, which are in
+// x (or, before the batch, in hist). So every (channel, token) runs at once, where conv_step /
+// conv_head walk the tokens of a channel in order. hist is left untouched; conv_hist_update then
+// shifts the batch's last nc-1 inputs in (a separate dispatch, after every reader of the old hist).
+
+// value of channel c at batch position p (p < 0: from hist, which is [nc-1][ch], oldest first)
+inline float conv_at(device const float *x, device const float *hist, int p, uint nh, uint ch, uint c) {
+    return p >= 0 ? x[(ulong)p * ch + c] : hist[(ulong)(int(nh) + p) * ch + c];
+}
+
+// Grid: (ceil(ch / 256), n_tokens), 256 threads. Same arguments as conv_step.
+kernel void conv_step_par(device const float *x [[buffer(0)]], device const float *hist [[buffer(1)]], device const float *taps [[buffer(2)]],
+                          device const float *dyn [[buffer(3)]], device float *y [[buffer(4)]], constant ConvArgs &a [[buffer(5)]],
+                          device const float *res [[buffer(6)]], device float *y2 [[buffer(7)]], device float *snap [[buffer(8)]],
+                          uint2 gid [[thread_position_in_grid]]) {
+    uint c = gid.x, t = gid.y;
+    if (c >= a.ch || t >= a.n_tokens) return;
+    uint nh = a.nc - 1;
+    uint h = a.dyn_heads ? c / (a.ch / a.dyn_heads) : 0;
+    float acc = 0.0f, x0 = 0.0f;
+    for (uint l = 0; l < a.nc; ++l) {
+        float v = conv_at(x, hist, int(t) - int(l), nh, a.ch, c);
+        if (l == 0) x0 = v;
+        acc += taps[c * a.nc + (a.nc - 1 - l)] * v;
+        if (a.dyn_heads) acc += dyn[((ulong)t * a.dyn_heads + h) * a.nc + l] * v;
+    }
+    float out = (x0 + acc) * a.scale;
+    ulong i = (ulong)t * a.ch + c;
+    y[i] = out;
+    if (a.second == 1) y2[i] = out;
+    else if (a.second == 2) y2[i] = res[i] + out;
+    // history after token t: row nh-l holds the input at t+1-l
+    if (a.snap)
+        for (uint l = 1; l < a.nc; ++l) snap[((ulong)t * nh + nh - l) * a.ch + c] = conv_at(x, hist, int(t + 1) - int(l), nh, a.ch, c);
+}
+
+// Grid: (n_kv_heads, n_tokens), head_dim threads. Same arguments as conv_head.
+template <typename KV>
+kernel void conv_head_par(device const float *x [[buffer(0)]], device const float *hist [[buffer(1)]], device const float *taps [[buffer(2)]],
+                          device const float *dynw [[buffer(3)]], device KV *y [[buffer(4)]], constant ConvHeadArgs &a [[buffer(5)]],
+                          device float *snap [[buffer(6)]], uint2 g [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float scratch[32];
+    uint h = g.x, t = g.y;
+    uint c = h * a.head_dim + tid;
+    uint nh = a.nc - 1;
+    uint n_heads = a.kv_dim / a.head_dim;
+    float acc = 0.0f, x0 = 0.0f;
+    for (uint l = 0; l < a.nc; ++l) {
+        float v = conv_at(x, hist, int(t) - int(l), nh, a.kv_dim, c);
+        if (l == 0) x0 = v;
+        acc += taps[c * a.nc + (a.nc - 1 - l)] * v;
+        if (a.dyn) acc += dynw[((ulong)t * n_heads + h) * a.nc + l] * v;
+    }
+    float out = (x0 + acc) * a.scale;
+    float ss = tg_sum(out * out, scratch, tid, a.head_dim);
+    float f = a.mode == 0 ? min(1.0f, a.threshold / (sqrt(ss) + 1e-6f)) : rsqrt(ss / a.head_dim + a.eps);
+    y[(ulong)t * a.kv_dim + c] = KV(out * f);
+    if (a.snap)
+        for (uint l = 1; l < a.nc; ++l) snap[((ulong)t * nh + nh - l) * a.kv_dim + c] = conv_at(x, hist, int(t + 1) - int(l), nh, a.kv_dim, c);
+}
+
+template [[host_name("conv_head_par_f32")]] kernel void conv_head_par<float>(device const float *, device const float *, device const float *,
+                                                                              device const float *, device float *, constant ConvHeadArgs &,
+                                                                              device float *, uint2, uint);
+template [[host_name("conv_head_par_f16")]] kernel void conv_head_par<half>(device const float *, device const float *, device const float *,
+                                                                             device const float *, device half *, constant ConvHeadArgs &,
+                                                                             device float *, uint2, uint);
+
+// hist <- the last nc-1 inputs once the batch of n tokens is in: row r holds position n-nh+r
+// (from x, or from an older hist row when the batch is shorter than nh). Rows ascend and read only
+// higher old rows, so one thread per channel can shift in place. Grid: ceil(ch / 256), 256 threads.
+struct ConvHistArgs {
+    uint ch;
+    uint nc;
+    uint n_tokens;
+};
+
+kernel void conv_hist_update(device const float *x [[buffer(0)]], device float *hist [[buffer(1)]], constant ConvHistArgs &a [[buffer(2)]],
+                             uint c [[thread_position_in_grid]]) {
+    if (c >= a.ch) return;
+    uint nh = a.nc - 1;
+    for (uint r = 0; r < nh; ++r) {
+        int p = int(a.n_tokens) - int(nh) + int(r);
+        hist[(ulong)r * a.ch + c] = p >= 0 ? x[(ulong)p * a.ch + c] : hist[(ulong)(int(nh) + p) * a.ch + c];
+    }
+}

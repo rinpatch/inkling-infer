@@ -72,6 +72,13 @@ struct ConvArgs {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct ConvHistArgs {
+    ch: u32,
+    nc: u32,
+    n_tokens: u32,
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct ConvHeadArgs {
     kv_dim: u32,
     head_dim: u32,
@@ -1224,7 +1231,7 @@ impl MetalModel {
             Second::AddRes(r, o) => (2, r, o),
         };
         e.dispatch(
-            "conv_step",
+            if nt > 1 { "conv_step_par" } else { "conv_step" },
             &[
                 buf(x),
                 buf(hist),
@@ -1243,6 +1250,29 @@ impl MetalModel {
                 buf(res),
                 buf(y2),
                 self.snap_buf(snap),
+            ],
+            (ch.div_ceil(256), if nt > 1 { nt } else { 1 }, 1),
+            (256, 1, 1),
+        )
+    }
+
+    /// After a token-parallel conv of `nt` > 1 tokens: shifts the batch's last inputs into the
+    /// history. Must come after every dispatch that reads the old history (no-op for one token,
+    /// where the sequential kernels update it themselves).
+    fn conv_hist(&self, e: &mut Encoder, x: &Buffer, hist: &Buffer, ch: usize, nt: usize) -> Result<()> {
+        if nt == 1 {
+            return Ok(());
+        }
+        e.dispatch(
+            "conv_hist_update",
+            &[
+                buf(x),
+                buf(hist),
+                bytes(&ConvHistArgs {
+                    ch: ch as u32,
+                    nc: self.hp.n_conv as u32,
+                    n_tokens: nt as u32,
+                }),
             ],
             (ch.div_ceil(256), 1, 1),
             (256, 1, 1),
@@ -1772,10 +1802,11 @@ impl MetalModel {
             ] {
                 let dyn_ = dynw.is_some();
                 e.dispatch(
-                    if self.kv_f16 {
-                        "conv_head_f16"
-                    } else {
-                        "conv_head_f32"
+                    match (nt > 1, self.kv_f16) {
+                        (true, true) => "conv_head_par_f16",
+                        (true, false) => "conv_head_par_f32",
+                        (false, true) => "conv_head_f16",
+                        (false, false) => "conv_head_f32",
                     },
                     &[
                         buf(lin),
@@ -1797,7 +1828,7 @@ impl MetalModel {
                         }),
                         self.snap_buf(self.snap_off(sid, mode as usize)),
                     ],
-                    (nkv, 1, 1),
+                    (nkv, if nt > 1 { nt } else { 1 }, 1),
                     (hd, 1, 1),
                 )?;
             }
@@ -1813,6 +1844,10 @@ impl MetalModel {
                 nt,
             )?;
             Ok(())
+        })?;
+        e.parallel(|e| {
+            self.conv_hist(e, &a.k_lin, &slot.conv[0], kvd, nt)?;
+            self.conv_hist(e, &a.v_lin, &slot.conv[1], kvd, nt)
         })?;
         rec(e, "Qcur", s, &a.q, 0, qd)?;
         if !self.kv_f16 {
@@ -2008,6 +2043,7 @@ impl MetalModel {
                 self.snap_off(sid, 2),
             )
         })?;
+        self.conv_hist(e, &a.wo_out, &slot.conv[2], d, nt)?;
         if boundary {
             *n_blocks += 1;
         }
@@ -2082,6 +2118,7 @@ impl MetalModel {
             nt,
             self.snap_off(sid, 3),
         )?;
+        self.conv_hist(e, &a.y, &slot.conv[3], d, nt)?;
         rec(e, "ffn_out", s, &a.ffn, 0, d)?;
         rec(e, "l_out", s, &a.h, 0, d)?;
         Ok(())

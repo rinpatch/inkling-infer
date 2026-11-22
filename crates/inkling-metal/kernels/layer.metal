@@ -852,3 +852,92 @@ kernel void conv_hist_update(device const float *x [[buffer(0)]], device float *
         hist[(ulong)r * a.ch + c] = p >= 0 ? x[(ulong)p * a.ch + c] : hist[(ulong)(int(nh) + p) * a.ch + c];
     }
 }
+
+// ---- depth mix for decode and short batches: split over the hidden dimension -------------------
+// depth_mix runs one threadgroup per token, so a decode step had one core read every block state
+// (~15 us per call, 120 calls per token). Here MIX_SLICES threadgroups per token each take a slice
+// of d: depth_mix_part writes the slice's partial |S_s|^2 and q.S_s sums, depth_mix_apply reduces
+// the partials (a few dozen floats), takes the softmax over states and writes its slice of out.
+#define MIX_SLICES 9
+#define MIX_NV (MIX_MAX_STATES * (MIX_MAX_Q + 1))
+
+// Grid: (MIX_SLICES, n_tokens), 256 threads. part: [token][slice][MIX_NV].
+kernel void depth_mix_part(device const float *blocks [[buffer(0)]], device const float *cur [[buffer(1)]],
+                           device const float *queries [[buffer(2)]], device float *part [[buffer(3)]], constant MixArgs &a [[buffer(4)]],
+                           uint2 g [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float red[8][MIX_NV];
+    uint t = g.y, sl = g.x;
+    blocks += (ulong)t * a.d;
+    cur += (ulong)t * a.d;
+    uint ns = a.n_blocks + 1, nv = ns * (a.n_q + 1);
+    uint chunk = (a.d + MIX_SLICES - 1) / MIX_SLICES;
+    uint lo = sl * chunk, hi = min(lo + chunk, a.d);
+#define state(s) ((s) < a.n_blocks ? blocks + (ulong)(s) * a.plane : cur)
+    float acc[MIX_NV];
+    for (uint v = 0; v < nv; ++v) acc[v] = 0.0f;
+    for (uint i = lo + tid; i < hi; i += 256) {
+        float qv[MIX_MAX_Q];
+        for (uint q = 0; q < a.n_q; ++q) qv[q] = queries[q * a.d + i];
+        for (uint s = 0; s < ns; ++s) {
+            float x = state(s)[i];
+            acc[s] += x * x;
+            for (uint q = 0; q < a.n_q; ++q) acc[ns + q * ns + s] += x * qv[q];
+        }
+    }
+#undef state
+    uint sg = tid / 32, lane = tid % 32;
+    for (uint v = 0; v < nv; ++v) {
+        float r = simd_sum(acc[v]);
+        if (lane == 0) red[sg][v] = r;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < nv) {
+        float r = 0.0f;
+        for (uint k = 0; k < 8; ++k) r += red[k][tid];
+        part[((ulong)t * MIX_SLICES + sl) * MIX_NV + tid] = r;
+    }
+}
+
+// Grid: (MIX_SLICES, n_tokens), 256 threads.
+kernel void depth_mix_apply(device const float *blocks [[buffer(0)]], device const float *cur [[buffer(1)]],
+                            device const float *part [[buffer(2)]], device float *out [[buffer(3)]], constant MixArgs &a [[buffer(4)]],
+                            uint2 g [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float tot[MIX_NV];
+    threadgroup float inv_rms[MIX_MAX_STATES];
+    threadgroup float p[MIX_MAX_Q][MIX_MAX_STATES];
+    uint t = g.y, sl = g.x;
+    blocks += (ulong)t * a.d;
+    cur += (ulong)t * a.d;
+    out += (ulong)t * a.d;
+    uint ns = a.n_blocks + 1, nv = ns * (a.n_q + 1);
+    if (tid < nv) {
+        float r = 0.0f;
+        for (uint k = 0; k < MIX_SLICES; ++k) r += part[((ulong)t * MIX_SLICES + k) * MIX_NV + tid];
+        tot[tid] = r;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < ns) inv_rms[tid] = rsqrt(tot[tid] / a.d + 1e-6f);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < a.n_q) {
+        float sc = rsqrt(float(a.d));
+        float m = -INFINITY;
+        for (uint s = 0; s < ns; ++s) {
+            p[tid][s] = tot[ns + tid * ns + s] * inv_rms[s] * sc;
+            m = max(m, p[tid][s]);
+        }
+        float sum = 0.0f;
+        for (uint s = 0; s < ns; ++s) { p[tid][s] = exp(p[tid][s] - m); sum += p[tid][s]; }
+        for (uint s = 0; s < ns; ++s) p[tid][s] /= sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint chunk = (a.d + MIX_SLICES - 1) / MIX_SLICES;
+    uint lo = sl * chunk, hi = min(lo + chunk, a.d);
+#define state(s) ((s) < a.n_blocks ? blocks + (ulong)(s) * a.plane : cur)
+    for (uint i = lo + tid; i < hi; i += 256)
+        for (uint q = 0; q < a.n_q; ++q) {
+            float o = 0.0f;
+            for (uint s = 0; s < ns; ++s) o += p[q][s] * inv_rms[s] * state(s)[i];
+            out[(ulong)q * a.plane + i] = o;
+        }
+#undef state
+}

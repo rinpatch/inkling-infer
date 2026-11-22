@@ -245,6 +245,9 @@ pub const MAX_BATCH: usize = 512;
 const MOE_NR: usize = 2;
 /// Largest speculative verify batch (anchor + 7 drafts).
 pub const MAX_VERIFY: usize = 8;
+/// Hidden-dimension slices of the short-batch depth mix (kernels/layer.metal MIX_SLICES, MIX_NV).
+const MIX_SLICES: usize = 9;
+const MIX_NV: usize = 8 * 5;
 /// Visible keys from which decode attention uses the one-thread-per-key kernel.
 const ATTN_TPK_MIN: usize = 512;
 const MAX_BLOCKS: usize = 8;
@@ -341,6 +344,8 @@ struct Act {
     tmp: Buffer,
     logits: Buffer,
     tokens: Buffer,
+    /// depth_mix_part partial sums, [token][slice][MIX_NV]
+    mix_part: Buffer,
     grp_count: Buffer,
     grp_offset: Buffer,
     grp_pairs: Buffer,
@@ -593,6 +598,7 @@ impl MetalModel {
             tmp: nb(ub * d)?,
             logits: nb(hp.n_vocab)?,
             tokens: nb(ub)?,
+            mix_part: nb(MAX_VERIFY * MIX_SLICES * MIX_NV)?,
             grp_count: nb(hp.n_expert)?,
             grp_offset: nb(hp.n_expert)?,
             grp_pairs: nb(ub * hp.n_expert_used)?,
@@ -1202,6 +1208,39 @@ impl MetalModel {
     ) -> Result<()> {
         let d = self.hp.n_embd;
         let plane = (self.max_batch * d) as u32;
+        let args = MixArgs {
+            d: d as u32,
+            n_blocks: n_blocks as u32,
+            n_q: n_q as u32,
+            plane,
+        };
+        if nt <= MAX_VERIFY {
+            // decode / short batches: slices of d across threadgroups instead of one per token
+            e.dispatch(
+                "depth_mix_part",
+                &[
+                    buf(blocks),
+                    buf(cur),
+                    buf_at(&self.w, q.0),
+                    buf(&self.a.mix_part),
+                    bytes(&args),
+                ],
+                (MIX_SLICES, nt, 1),
+                (256, 1, 1),
+            )?;
+            return e.dispatch(
+                "depth_mix_apply",
+                &[
+                    buf(blocks),
+                    buf(cur),
+                    buf(&self.a.mix_part),
+                    buf(out),
+                    bytes(&args),
+                ],
+                (MIX_SLICES, nt, 1),
+                (256, 1, 1),
+            );
+        }
         e.dispatch(
             "depth_mix",
             &[

@@ -330,6 +330,20 @@ unsafe extern "C" {
     fn mach_timebase_info(info: *mut MachTimebase) -> i32;
 }
 
+fn skip_prefixes() -> &'static [String] {
+    static P: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    P.get_or_init(|| {
+        std::env::var("INKLING_SKIP")
+            .map(|v| {
+                v.split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+}
+
 fn double_prefix() -> Option<&'static str> {
     static P: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     P.get_or_init(|| std::env::var("INKLING_DOUBLE").ok())
@@ -394,6 +408,14 @@ impl Encoder<'_> {
         groups: (usize, usize, usize),
         threads: (usize, usize, usize),
     ) -> Result<()> {
+        // INKLING_SKIP=<prefix>[,<prefix>...]: drop matching dispatches (an upper bound on what
+        // fusing them away could save; results are garbage, measurement only)
+        if skip_prefixes()
+            .iter()
+            .any(|p| kernel.starts_with(p.as_str()))
+        {
+            return Ok(());
+        }
         let p = self.ctx.pipeline(kernel)?;
         // a kernel's register use can lower its thread limit below what the caller dispatches;
         // Metal would then not run it correctly, without any error

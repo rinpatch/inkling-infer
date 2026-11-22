@@ -1,0 +1,12 @@
+== osaurus JANGH2, 512-token prompt
+Load: 3.30s
+Model: Inkling2LoopModel
+  warmup done (32 tokens)
+  Turn 1: total prompt=512, NEW=512 | prefill 267 tok/s (1915ms TTFT) | decode 48.3 tok/s (128 tokens, 2.628s)
+    first tokens: [198, 149862, 150643, 62, 102798, 62, 4465, 11, 198, 149862, 150643, 62, 108361, 62, 4465, 11, 198, 149862, 150643, 62]
+== osaurus JANGH2, 4096-token prompt
+Load: 1.97s
+Model: Inkling2LoopModel
+  warmup done (32 tokens)
+  Turn 1: total prompt=4096, NEW=4096 | prefill 333 tok/s (12284ms TTFT) | decode 45.7 tok/s (128 tokens, 2.778s)
+    first tokens: [32202, 14, 1121, 14, 52730, 62, 54461, 14, 37929, 14, 63713, 14, 49423, 62, 32691, 62, 4597, 13, 1746, 2]

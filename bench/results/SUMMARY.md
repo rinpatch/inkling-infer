@@ -34,3 +34,14 @@ Decode roofline ≈ 68 tok/s (≈4.0 GB of weights read per token, see docs/refe
 | ours `b402c50` | IQ4_NL GGUF | ~307 | 40.7 (@0) | ~213 | 34.2 |
 
 Setup notes: RunBench's generic loader tries the VLM factory first, which can't decode `jangtq2`. The LLM factory has the Inkling JANGH preparation but refuses symlinked files, so the HF snapshot has to be copied as regular files (`cp -R -L -c`, an APFS clone) to `~/models/Inkling-2-Mini-JANGH2`. Most of the decode gap is format: about 3.1 vs 4.0 GB read per token.
+
+## Ollama 0.40.17 (MLX runner, mlx 0.32.4), native NVFP4, 2026-11-22
+
+`thinkingmachines/Inkling-2-Mini`, imported from the local HF snapshot with `ollama create` (FROM <snapshot dir>; "preserving source quantization": NVFP4 experts, MXFP8 last 4 layers, BF16 trunk; 19 GB). `ollama ps` reports the `mlx` runner. Measured with `bench/ollama_bench.py` from Ollama's own timing fields: median of 3 after a warmup, raw prompts cut from fixtures/prompts/long.txt, greedy, 128 tokens. Decode is measured after the prompt.
+
+| engine | weights | pp (524 tok) | decode @524 | pp (4567 tok) | decode @4567 |
+|---|---|---|---|---|---|
+| Ollama | NVFP4 (official) | 292.0 | 20.9 | 303.7 | 21.0 |
+| ours `082f75c` | IQ4_NL GGUF | ~325 (pp512) | 40.4 (@0) | ~315 (pp4096) | 34.2 (@4096) |
+
+The MLX runner ignores `cache_prompt: false` and reuses a shared prompt prefix, so the script puts a random tag at the start of every prompt. Without it, prefill measures 9k–84k tok/s. Its decode is flat with context (about 21 tok/s), and BF16 attention weights make it read about 1.2 GB more per token than the Q8_0 attention in the GGUF (16 vs 8.5 bits).

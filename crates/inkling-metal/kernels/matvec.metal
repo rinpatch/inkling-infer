@@ -332,3 +332,24 @@ kernel void mv_f32_rowtg(device const float *W [[buffer(0)]], device const float
     float s = tg_sum(acc, scratch, tid, 256);
     if (tid == 0) y[(ulong)tg.y * a.rows + tg.x] = s;
 }
+
+// Bandwidth probes for examples/kernel_bw.rs: the same bytes read with aligned 16-byte loads, or
+// as 18-byte IQ4_NL blocks the way half_dot reads them (scale + two packed 4-byte loads per half).
+kernel void bw_aligned(device const uint4 *src [[buffer(0)]], device uint *out [[buffer(1)]], constant uint &n16 [[buffer(2)]],
+                       uint gid [[thread_position_in_grid]], uint nthreads [[threads_per_grid]]) {
+    uint4 acc = 0;
+    for (uint i = gid; i < n16; i += nthreads) acc ^= src[i];
+    out[gid] = acc.x ^ acc.y ^ acc.z ^ acc.w;
+}
+
+kernel void bw_blocks18(device const block_iq4_nl *src [[buffer(0)]], device uint *out [[buffer(1)]], constant uint &nhalf [[buffer(2)]],
+                        uint gid [[thread_position_in_grid]], uint nthreads [[threads_per_grid]]) {
+    uint acc = 0;
+    for (uint t = gid; t < nhalf; t += nthreads) {
+        device const block_iq4_nl *b = src + t / 2;
+        device const packed_uchar4 *q = (device const packed_uchar4 *)(b->qs + 8 * (t % 2));
+        uchar4 a = uchar4(q[0]), c = uchar4(q[1]);
+        acc ^= as_type<ushort>(b->d) ^ as_type<uint>(a) ^ as_type<uint>(c);
+    }
+    out[gid] = acc;
+}

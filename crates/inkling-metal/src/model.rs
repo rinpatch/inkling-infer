@@ -4,6 +4,9 @@
 use gguf::{DType, Gguf};
 use inkling::{Hparams, Trace};
 
+mod drafter;
+pub use drafter::{DraftDebug, SpecOut};
+
 use crate::runtime::{Buffer, Context, Encoder, Error, Result, RunStats, buf, buf_at, bytes};
 
 #[repr(C)]
@@ -368,6 +371,8 @@ pub struct MetalModel {
     /// `snap_off`. Allocated on first use; `verify_rows` > 0 only while a verify is encoded.
     conv_snap: Option<Buffer>,
     verify_rows: usize,
+    /// DSpark drafter (`load_drafter`), kept in sync with every forward.
+    drafter: Option<Box<drafter::MetalDrafter>>,
 }
 
 fn tensor(g: &Gguf, name: &str, want: DType) -> Result<T> {
@@ -599,6 +604,7 @@ impl MetalModel {
             capture: None,
             conv_snap: None,
             verify_rows: 0,
+            drafter: None,
             kv_f16: opts.kv_f16,
             pos: 0,
             trace_buf,
@@ -637,6 +643,7 @@ impl MetalModel {
     /// clearing.
     pub fn reset(&mut self) {
         self.pos = 0;
+        self.dr_set_len(0);
         for s in &self.slots {
             for c in &s.conv {
                 c.as_mut_slice::<f32>().fill(0.0);
@@ -700,7 +707,8 @@ impl MetalModel {
                 Ok(())
             };
             this.a.tokens.write(&[token]);
-            this.encode(e, 1, None, &mut rec)
+            this.encode(e, 1, None, &mut rec)?;
+            this.dr_after_forward(e, 1, this.pos)
         })?;
 
         self.last = stats;
@@ -709,6 +717,7 @@ impl MetalModel {
             tr.record(r.name, r.slot, &tb[r.offset..r.offset + r.len]);
         }
         self.pos += 1;
+        self.dr_set_len(self.pos);
         Ok(self.a.logits.as_slice::<f32>()[..self.hp.n_vocab].to_vec())
     }
 
@@ -734,6 +743,7 @@ impl MetalModel {
             let this = &*self;
             let p = this.ctx.submit(|e| {
                 this.encode(e, 1, None, &mut noop)?;
+                this.dr_after_forward(e, 1, this.pos)?;
                 e.dispatch(
                     "argmax_token",
                     &[
@@ -750,6 +760,7 @@ impl MetalModel {
                 )
             })?;
             self.pos += 1;
+            self.dr_set_len(self.pos);
             in_flight.push_back(p);
             if in_flight.len() > 2 {
                 self.last = in_flight.pop_front().expect("non-empty").wait()?;
@@ -880,10 +891,12 @@ impl MetalModel {
         for chunk in tokens.chunks(self.max_batch) {
             let this = &*self;
             this.a.tokens.write(chunk);
-            self.last = this
-                .ctx
-                .run(|e| this.encode(e, chunk.len(), None, &mut |_, _, _, _, _, _| Ok(())))?;
+            self.last = this.ctx.run(|e| {
+                this.encode(e, chunk.len(), None, &mut |_, _, _, _, _, _| Ok(()))?;
+                this.dr_after_forward(e, chunk.len(), this.pos)
+            })?;
             self.pos += chunk.len();
+            self.dr_set_len(self.pos);
         }
         Ok(self.a.logits.as_slice::<f32>()[..self.hp.n_vocab].to_vec())
     }
@@ -902,14 +915,22 @@ impl MetalModel {
         for chunk in tokens.chunks(self.max_batch) {
             let this = &*self;
             this.a.tokens.write(chunk);
-            self.last = this
-                .ctx
-                .run(|e| this.encode(e, chunk.len(), Some(&out), &mut |_, _, _, _, _, _| Ok(())))?;
+            self.last = this.ctx.run(|e| {
+                this.encode(e, chunk.len(), Some(&out), &mut |_, _, _, _, _, _| Ok(()))?;
+                // a CPU-driven verify commits the kept rows itself
+                if this.verify_rows == 0 {
+                    this.dr_after_forward(e, chunk.len(), this.pos)?;
+                }
+                Ok(())
+            })?;
             let lg = out.as_slice::<f32>();
             for (i, _) in chunk.iter().enumerate() {
                 f(self.pos + i, &lg[i * nv..(i + 1) * nv]);
             }
             self.pos += chunk.len();
+            if self.verify_rows == 0 {
+                self.dr_set_len(self.pos);
+            }
         }
         Ok(())
     }
@@ -2180,6 +2201,33 @@ impl MetalModel {
                 )?;
             }
             return Ok(());
+        }
+        // with the drafter's capture on, every row's final normed hidden is a feature
+        if nt > 1
+            && let Some(c) = &self.capture
+        {
+            self.mix(
+                e,
+                &a.blocks,
+                n_blocks,
+                &a.h,
+                self.output_res_query,
+                1,
+                &a.m,
+                nt,
+            )?;
+            self.norm(
+                e,
+                &a.m,
+                0,
+                Some(self.output_norm),
+                &a.n,
+                0,
+                d,
+                hp.rms_eps,
+                nt,
+            )?;
+            self.copy(e, &a.n, 0, c, 3 * plane, nt * d)?;
         }
         // only the last token's logits are needed: run the output head on that row
         let last = (nt - 1) * d;

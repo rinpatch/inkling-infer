@@ -3,7 +3,10 @@
 mod quant;
 pub mod safetensors;
 
-pub use quant::{BLOCK_IQ4_NL_BYTES, BLOCK_Q8_0_BYTES, IQ4_NL_VALUES, QK, dequantize_row, dot_row};
+pub use quant::{
+    BLOCK_IQ4_NL_BYTES, BLOCK_Q8_0_BYTES, IQ4_NL_VALUES, QK, dequantize_row, dot_row,
+    quantize_row_q8_0,
+};
 
 use std::collections::HashMap;
 use std::fs::File;

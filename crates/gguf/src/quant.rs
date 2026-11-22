@@ -177,3 +177,39 @@ mod tests {
         );
     }
 }
+
+/// Quantizes `x` (length % 32 == 0) to Q8_0 blocks, as ggml's reference does: per block
+/// d = max|x| / 127 stored as f16, q = round(x / d).
+pub fn quantize_row_q8_0(x: &[f32], out: &mut Vec<u8>) {
+    assert!(x.len().is_multiple_of(QK));
+    for blk in x.chunks_exact(QK) {
+        let amax = blk.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let d = amax / 127.0;
+        let id = if d > 0.0 { 1.0 / d } else { 0.0 };
+        out.extend_from_slice(&half::f16::from_f32(d).to_le_bytes());
+        out.extend(blk.iter().map(|v| ((v * id).round() as i8) as u8));
+    }
+}
+
+#[cfg(test)]
+mod q8_tests {
+    use super::*;
+
+    #[test]
+    fn q8_0_round_trip() {
+        let x: Vec<f32> = (0..256)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) * 0.013)
+            .collect();
+        let mut q = Vec::new();
+        quantize_row_q8_0(&x, &mut q);
+        assert_eq!(q.len(), 256 / QK * BLOCK_Q8_0_BYTES);
+        let mut y = vec![0.0; 256];
+        dequantize_row(crate::DType::Q8_0, &q, &mut y);
+        let max_err = x
+            .iter()
+            .zip(&y)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max);
+        assert!(max_err < 0.66 / 127.0 * 0.7, "max err {max_err}");
+    }
+}

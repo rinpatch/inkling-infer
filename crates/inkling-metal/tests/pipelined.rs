@@ -129,3 +129,62 @@ fn verify_then_rewind_matches_the_kept_prefix() {
         );
     }
 }
+
+fn native_dir() -> Option<PathBuf> {
+    let home = PathBuf::from(std::env::var_os("HOME")?);
+    let snaps =
+        home.join(".cache/huggingface/hub/models--thinkingmachines--Inkling-2-Mini/snapshots");
+    fs::read_dir(snaps)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.join("mtp.safetensors").exists())
+}
+
+/// Speculative decoding with the Metal drafter reproduces greedy decode (exact numerics, so batch
+/// verify and decode steps agree), and the drafter's guesses are accepted at a sane rate.
+#[test]
+fn speculative_matches_greedy() {
+    let (Some(mp), Some(native)) = (model_path(), native_dir()) else {
+        eprintln!("SKIP: model or native checkpoint (mtp.safetensors) not found");
+        return;
+    };
+    let text = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/prompts/long.txt"),
+    )
+    .unwrap();
+    let g = gguf::Gguf::open(mp).unwrap();
+    let hp = Hparams::from_gguf(&g).unwrap();
+    let tok = inkling::tokenizer::Tokenizer::from_gguf(&g).unwrap();
+    let mut prompt = tok.encode(&text);
+    prompt.truncate(300);
+    let n = 96;
+    let mut m = MetalModel::with_options(
+        &g,
+        hp.clone(),
+        prompt.len() + n + 16,
+        Options { kv_f16: false },
+    )
+    .unwrap();
+    m.exact_prefill = true;
+    let (head, last) = prompt.split_at(prompt.len() - 1);
+    m.prefill(head).unwrap();
+    let want = m.decode_greedy(last[0], n).unwrap();
+
+    m.reset();
+    m.load_drafter(&native).unwrap();
+    m.prefill(head).unwrap();
+    let got = m.decode_speculative(last[0], n).unwrap();
+    println!(
+        "{} tokens in {} rounds: {:.2} tokens / round, {:.2} accepted drafts / round",
+        n,
+        got.rounds,
+        n as f64 / got.rounds as f64,
+        got.accepted as f64 / got.rounds as f64
+    );
+    assert_eq!(got.tokens, want, "speculative output differs from greedy");
+    assert!(
+        got.accepted as f64 / got.rounds as f64 > 0.5,
+        "the drafter's guesses are almost never accepted"
+    );
+}

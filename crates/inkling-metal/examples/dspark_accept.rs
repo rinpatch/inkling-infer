@@ -49,6 +49,13 @@ fn main() -> anyhow::Result<()> {
     m.enable_capture()?;
     let mut ds = DraftState::default();
     // prompt: one ubatch at a time, committing every position's features
+    // ANCHOR_LAST=1: prefill all but the last prompt token and use it as the first anchor (the
+    // protocol of tests/pipelined.rs speculative_matches_greedy)
+    let anchor_last = std::env::var_os("ANCHOR_LAST").is_some();
+    let last_tok = *prompt.last().unwrap();
+    if anchor_last {
+        prompt.pop();
+    }
     let mut last_logits = Vec::new();
     for chunk in prompt.chunks(256) {
         let mut lg = Vec::new();
@@ -58,7 +65,11 @@ fn main() -> anyhow::Result<()> {
         }
         last_logits = lg;
     }
-    let mut anchor = argmax(&last_logits);
+    let mut anchor = if anchor_last {
+        last_tok
+    } else {
+        argmax(&last_logits)
+    };
 
     let (mut generated, mut rounds, mut accepted_total) = (0usize, 0usize, 0usize);
     let mut hist = [0usize; drafter::BLOCK];

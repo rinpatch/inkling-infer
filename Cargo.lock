@@ -159,6 +159,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "gguf",
+ "half",
  "inkling",
  "objc2",
  "objc2-foundation",

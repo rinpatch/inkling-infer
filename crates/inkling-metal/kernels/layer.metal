@@ -333,3 +333,116 @@ kernel void rms_norm_strided(device const float *x [[buffer(0)]], device float *
     float inv = rsqrt(tg_sum(ss, scratch, tid, ntg) / a.n + a.eps);
     for (uint i = tid; i < a.n; i += ntg) y[i] = x[i] * inv;
 }
+
+// ---- split-K decode attention -------------------------------------------------------------------
+// For one query token, a single threadgroup per head leaves the GPU idle and re-reads each KV head
+// once per query head. Here a threadgroup takes one KV head and one block of ATTN_SPLIT keys for
+// all the query heads that share it (GQA), writes partial (max, sum, accumulator) results, and
+// attn_combine merges the blocks per head, adding the sink logit.
+
+#define ATTN_SPLIT 256
+#define ATTN_MAX_GRP 4
+
+struct SplitArgs {
+    uint head_dim;    // == threads per threadgroup (128)
+    uint n_head;
+    uint n_kv_head;
+    uint n_rel;
+    uint pos;         // query position
+    uint first;       // first visible key
+    uint extent;
+    float scale;
+    uint kv_dim;
+    uint n_split;     // blocks of ATTN_SPLIT keys covering [first, pos]
+};
+
+// Grid: (n_kv_head, n_split), head_dim threads. Partials: pm/pl [n_head][n_split], pacc [n_head][n_split][head_dim].
+kernel void attn_split(device const float *q [[buffer(0)]], device const float *kc [[buffer(1)]], device const float *vc [[buffer(2)]],
+                       device const float *r [[buffer(3)]], device const float *rel_bias [[buffer(4)]], device float *pm [[buffer(5)]],
+                       device float *pl [[buffer(6)]], device float *pacc [[buffer(7)]], constant SplitArgs &a [[buffer(8)]],
+                       uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+    const uint ntg = a.head_dim;
+    const uint grp = a.n_head / a.n_kv_head;
+    threadgroup float scratch[32];
+    threadgroup float qs[ATTN_MAX_GRP * 128];
+    threadgroup float rs[ATTN_MAX_GRP * 32];
+    threadgroup float pl_t[ATTN_MAX_GRP][ATTN_CHUNK];
+    uint kvh = tg.x, s = tg.y;
+    for (uint g = 0; g < grp; ++g) {
+        uint h = kvh * grp + g;
+        for (uint i = tid; i < a.head_dim; i += ntg) qs[g * a.head_dim + i] = q[h * a.head_dim + i];
+        for (uint i = tid; i < a.n_rel; i += ntg) rs[g * a.n_rel + i] = r[h * a.n_rel + i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint lo = a.first + s * ATTN_SPLIT;
+    uint hi = min(lo + ATTN_SPLIT, a.pos + 1);
+    float m[ATTN_MAX_GRP], l[ATTN_MAX_GRP], acc[ATTN_MAX_GRP];
+    for (uint g = 0; g < grp; ++g) { m[g] = -INFINITY; l[g] = 0.0f; acc[g] = 0.0f; }
+    threadgroup float lg_t[ATTN_MAX_GRP][ATTN_CHUNK];
+    uint sg = tid / 32, lane = tid % 32, nsg = ntg / 32;
+    for (uint j0 = lo; j0 < hi; j0 += ATTN_CHUNK) {
+        uint n = min((uint)ATTN_CHUNK, hi - j0);
+        // logits: one simdgroup per key, each lane 4 of the 128 dims, so a key row is one
+        // contiguous 512-byte read (rows of the cache are kv_dim floats apart)
+        for (uint t = sg; t < n; t += nsg) {
+            uint j = j0 + t;
+            float4 kv = ((device const float4 *)(kc + (ulong)j * a.kv_dim + kvh * a.head_dim))[lane];
+            uint dist = a.pos - j;
+            for (uint g = 0; g < grp; ++g) {
+                float d = simd_sum(dot(((threadgroup const float4 *)(qs + g * a.head_dim))[lane], kv));
+                float bias = 0.0f;
+                if (dist < a.extent && lane < a.n_rel) bias = rs[g * a.n_rel + lane] * rel_bias[dist * a.n_rel + lane];
+                bias = simd_sum(bias);
+                if (lane == 0) lg_t[g][t] = d * a.scale + bias;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float lg[ATTN_MAX_GRP];
+        for (uint g = 0; g < grp; ++g) lg[g] = tid < n ? lg_t[g][tid] : -INFINITY;
+        for (uint g = 0; g < grp; ++g) {
+            float m_new = max(m[g], tg_max(lg[g], scratch, tid, ntg));
+            float p = tid < n ? exp(lg[g] - m_new) : 0.0f;
+            pl_t[g][tid] = p;
+            float corr = exp(m[g] - m_new);
+            l[g] = l[g] * corr + tg_sum(p, scratch, tid, ntg);
+            acc[g] *= corr;
+            m[g] = m_new;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        device const float *vp = vc + (ulong)j0 * a.kv_dim + kvh * a.head_dim + tid;
+        for (uint jj = 0; jj < n; ++jj) {
+            float v = vp[(ulong)jj * a.kv_dim];
+            for (uint g = 0; g < grp; ++g) acc[g] += pl_t[g][jj] * v;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint g = 0; g < grp; ++g) {
+        uint h = kvh * grp + g;
+        uint idx = h * a.n_split + s;
+        if (tid == 0) { pm[idx] = m[g]; pl[idx] = l[g]; }
+        pacc[(ulong)idx * a.head_dim + tid] = acc[g];
+    }
+}
+
+struct CombineAttnArgs {
+    uint head_dim;
+    uint n_split;
+};
+
+// out[h] = sum_s acc_s exp(m_s - M) / (sum_s l_s exp(m_s - M) + exp(sink - M)). Grid: n_head, head_dim threads.
+kernel void attn_combine(device const float *pm [[buffer(0)]], device const float *pl [[buffer(1)]], device const float *pacc [[buffer(2)]],
+                         device const float *sinks [[buffer(3)]], device float *out [[buffer(4)]], constant CombineAttnArgs &a [[buffer(5)]],
+                         uint h [[threadgroup_position_in_grid]], uint c [[thread_position_in_threadgroup]]) {
+    float sink = sinks[h];
+    float M = sink;
+    for (uint s = 0; s < a.n_split; ++s) M = max(M, pm[h * a.n_split + s]);
+    float total = exp(sink - M), acc = 0.0f;
+    for (uint s = 0; s < a.n_split; ++s) {
+        uint idx = h * a.n_split + s;
+        float w = exp(pm[idx] - M);  // exp(-inf) = 0 for empty blocks
+        total += pl[idx] * w;
+        acc += pacc[(ulong)idx * a.head_dim + c] * w;
+    }
+    out[h * a.head_dim + c] = acc / total;
+}

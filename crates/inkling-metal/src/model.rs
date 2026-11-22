@@ -79,6 +79,29 @@ struct AttnArgs {
 }
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct SplitArgs {
+    head_dim: u32,
+    n_head: u32,
+    n_kv_head: u32,
+    n_rel: u32,
+    pos: u32,
+    first: u32,
+    extent: u32,
+    scale: f32,
+    kv_dim: u32,
+    n_split: u32,
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CombineAttnArgs {
+    head_dim: u32,
+    n_split: u32,
+}
+/// Keys per decode-attention block (kernels/layer.metal ATTN_SPLIT).
+const ATTN_SPLIT: usize = 256;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct NArgs {
     n: u32,
     f: f32,
@@ -257,9 +280,12 @@ struct Act {
     grp_offset: Buffer,
     grp_pairs: Buffer,
     yp: Buffer,
-    gin: Buffer, // [nt][2d] normalized gate inputs
-    gf: Buffer,  // [nt][d] forget logits
-    gg: Buffer,  // [nt][d] gain logits
+    att_m: Buffer,   // [n_head][n_split] decode-attention partial maxima
+    att_l: Buffer,   // [n_head][n_split] partial sums
+    att_acc: Buffer, // [n_head][n_split][head_dim] partial accumulators
+    gin: Buffer,     // [nt][2d] normalized gate inputs
+    gf: Buffer,      // [nt][d] forget logits
+    gg: Buffer,      // [nt][d] gain logits
 }
 
 pub struct MetalModel {
@@ -463,6 +489,9 @@ impl MetalModel {
             grp_offset: nb(hp.n_expert)?,
             grp_pairs: nb(ub * hp.n_expert_used)?,
             yp: nb(ub * hp.n_expert_used * d)?,
+            att_m: nb(hp.n_head * max_ctx.div_ceil(ATTN_SPLIT))?,
+            att_l: nb(hp.n_head * max_ctx.div_ceil(ATTN_SPLIT))?,
+            att_acc: nb(hp.n_head * max_ctx.div_ceil(ATTN_SPLIT) * hp.head_dim)?,
             gin: nb(ub * 2 * d)?,
             gf: nb(ub * d)?,
             gg: nb(ub * d)?,
@@ -1306,32 +1335,89 @@ impl MetalModel {
         self.copy(e, &a.k, 0, &slot.k, self.pos * kvd, nt * kvd)?;
         self.copy(e, &a.v, 0, &slot.v, self.pos * kvd, nt * kvd)?;
 
-        assert_eq!(hd, 128, "attn_flash runs one thread per head dimension");
-        e.dispatch(
-            "attn_flash",
-            &[
-                buf(&a.q),
-                buf(&slot.k),
-                buf(&slot.v),
-                buf(&a.r),
-                buf_at(&self.w, lw.rel_bias.0),
-                buf(&a.sinks),
-                buf(&a.o),
-                bytes(&AttnArgs {
-                    head_dim: hd as u32,
-                    n_head: nh as u32,
-                    n_kv_head: nkv as u32,
-                    n_rel: nr as u32,
-                    pos0: self.pos as u32,
-                    n_swa: if lw.is_swa { hp.n_swa as u32 } else { 0 },
-                    extent: lw.rel_extent as u32,
-                    scale: 1.0 / (hd as f32).sqrt(),
-                    kv_dim: kvd as u32,
-                }),
-            ],
-            (nh, nt, 1),
-            (hd, 1, 1),
-        )?;
+        assert_eq!(
+            hd, 128,
+            "attention kernels run one thread per head dimension"
+        );
+        if nt == 1 {
+            // decode: split the visible keys into blocks across threadgroups, one per (kv head,
+            // block), then merge the blocks per head
+            let first = if lw.is_swa {
+                (self.pos + 1).saturating_sub(hp.n_swa)
+            } else {
+                0
+            };
+            let n_split = (self.pos + 1 - first).div_ceil(ATTN_SPLIT);
+            e.dispatch(
+                "attn_split",
+                &[
+                    buf(&a.q),
+                    buf(&slot.k),
+                    buf(&slot.v),
+                    buf(&a.r),
+                    buf_at(&self.w, lw.rel_bias.0),
+                    buf(&a.att_m),
+                    buf(&a.att_l),
+                    buf(&a.att_acc),
+                    bytes(&SplitArgs {
+                        head_dim: hd as u32,
+                        n_head: nh as u32,
+                        n_kv_head: nkv as u32,
+                        n_rel: nr as u32,
+                        pos: self.pos as u32,
+                        first: first as u32,
+                        extent: lw.rel_extent as u32,
+                        scale: 1.0 / (hd as f32).sqrt(),
+                        kv_dim: kvd as u32,
+                        n_split: n_split as u32,
+                    }),
+                ],
+                (nkv, n_split, 1),
+                (hd, 1, 1),
+            )?;
+            e.dispatch(
+                "attn_combine",
+                &[
+                    buf(&a.att_m),
+                    buf(&a.att_l),
+                    buf(&a.att_acc),
+                    buf(&a.sinks),
+                    buf(&a.o),
+                    bytes(&CombineAttnArgs {
+                        head_dim: hd as u32,
+                        n_split: n_split as u32,
+                    }),
+                ],
+                (nh, 1, 1),
+                (hd, 1, 1),
+            )?;
+        } else {
+            e.dispatch(
+                "attn_flash",
+                &[
+                    buf(&a.q),
+                    buf(&slot.k),
+                    buf(&slot.v),
+                    buf(&a.r),
+                    buf_at(&self.w, lw.rel_bias.0),
+                    buf(&a.sinks),
+                    buf(&a.o),
+                    bytes(&AttnArgs {
+                        head_dim: hd as u32,
+                        n_head: nh as u32,
+                        n_kv_head: nkv as u32,
+                        n_rel: nr as u32,
+                        pos0: self.pos as u32,
+                        n_swa: if lw.is_swa { hp.n_swa as u32 } else { 0 },
+                        extent: lw.rel_extent as u32,
+                        scale: 1.0 / (hd as f32).sqrt(),
+                        kv_dim: kvd as u32,
+                    }),
+                ],
+                (nh, nt, 1),
+                (hd, 1, 1),
+            )?;
+        }
         rec(e, "kqv_out", s, &a.o, qd)?;
         self.eltwise(e, "sigmoid_mul", &[&a.o, &a.gate], nt * qd, 0.0)?;
         if nt == 1 {

@@ -248,7 +248,7 @@ fn bench(args: &Args, g: &gguf::Gguf, hp: &Hparams) -> Result<()> {
     } else {
         "cpu"
     };
-    let tokens: Vec<u32> = (0..(args.pp.max(args.tg) + args.depth) as u32)
+    let tokens: Vec<u32> = (0..(args.pp.max(args.tg) + args.depth + 300) as u32)
         .map(|i| 1000 + (i * 7919) % 150000)
         .collect();
     let mut pp = Vec::new();
@@ -308,19 +308,19 @@ fn bench(args: &Args, g: &gguf::Gguf, hp: &Hparams) -> Result<()> {
     }
     if let (Engine::Metal(m), true) = (&mut eng, std::env::var_os("INKLING_PROFILE").is_some()) {
         m.reset();
-        for &t in &tokens[..64] {
-            m.step(t, &mut NoTrace)?;
-        }
+        // profile after `depth` tokens of context (at least 64)
+        let depth = args.depth.max(64);
+        m.prefill(&tokens[..depth])?;
         // INKLING_PROFILE=N profiles a batch of N tokens (1 = decode)
         let batch = std::env::var("INKLING_PROFILE")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(1)
             .clamp(1, 256);
-        let prof = m.profile_batch(&tokens[64..64 + batch])?;
+        let prof = m.profile_batch(&tokens[depth..depth + batch])?;
         let total: f64 = prof.iter().map(|p| p.1).sum();
         // timestamps come from separate per-dispatch encoders, so only the shares are meaningful
-        println!("per-kernel GPU share for {batch} token(s) at position 64:");
+        println!("per-kernel GPU share for {batch} token(s) at position {depth}:");
         for (k, t, n) in &prof {
             println!("  {k:28} {:5.1}%  x{n}", 100.0 * t / total);
         }

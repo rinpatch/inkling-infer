@@ -8,3 +8,4 @@ license.workspace = true
 memmap2.workspace = true
 half.workspace = true
 thiserror.workspace = true
+serde_json.workspace = true

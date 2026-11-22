@@ -1,6 +1,7 @@
 //! Minimal GGUF v3 reader: metadata, tensor directory, and zero-copy tensor bytes over an mmap.
 
 mod quant;
+pub mod safetensors;
 
 pub use quant::{BLOCK_IQ4_NL_BYTES, BLOCK_Q8_0_BYTES, IQ4_NL_VALUES, QK, dequantize_row, dot_row};
 
@@ -32,6 +33,8 @@ pub enum Error {
     MissingTensor(String),
     #[error("tensor {0} extends past the end of the file")]
     TensorBounds(String),
+    #[error("safetensors header: {0}")]
+    Header(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

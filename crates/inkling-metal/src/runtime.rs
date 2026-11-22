@@ -330,6 +330,12 @@ unsafe extern "C" {
     fn mach_timebase_info(info: *mut MachTimebase) -> i32;
 }
 
+fn double_prefix() -> Option<&'static str> {
+    static P: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    P.get_or_init(|| std::env::var("INKLING_DOUBLE").ok())
+        .as_deref()
+}
+
 /// Timing for one command buffer.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RunStats {
@@ -441,6 +447,13 @@ impl Encoder<'_> {
             depth: threads.2,
         };
         enc.dispatchThreadgroups_threadsPerThreadgroup(g, t);
+        // INKLING_DOUBLE=<kernel-name prefix>: run matching kernels twice, so a timing difference
+        // shows their true cost inside a real batch (results are garbage; measurement only)
+        if let Some(prefix) = double_prefix()
+            && kernel.starts_with(prefix)
+        {
+            enc.dispatchThreadgroups_threadsPerThreadgroup(g, t);
+        }
         if self.enc.is_none() {
             enc.endEncoding();
         } else if !self.in_parallel {

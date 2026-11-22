@@ -197,6 +197,13 @@ struct GroupArgs {
 }
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct TileArgs {
+    n_expert: u32,
+    max32: u32,
+    max16: u32,
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct MoeGemmArgs {
     n_embd: u32,
     n_ff: u32,
@@ -337,6 +344,11 @@ struct Act {
     grp_count: Buffer,
     grp_offset: Buffer,
     grp_pairs: Buffer,
+    /// MoE GEMM work lists (moe_tiles): (expert, first pair) of every 32-pair and 16-pair tile,
+    /// and the two list lengths
+    tiles32: Buffer,
+    tiles16: Buffer,
+    tile_counts: Buffer,
     yp: Buffer,
     att_m: Buffer,   // [n_head][n_split] decode-attention partial maxima
     att_l: Buffer,   // [n_head][n_split] partial sums
@@ -584,6 +596,9 @@ impl MetalModel {
             grp_count: nb(hp.n_expert)?,
             grp_offset: nb(hp.n_expert)?,
             grp_pairs: nb(ub * hp.n_expert_used)?,
+            tiles32: nb(2 * (ub * hp.n_expert_used / 32 + hp.n_expert))?,
+            tiles16: nb(2 * hp.n_expert)?,
+            tile_counts: nb(2)?,
             yp: nb(ub * hp.n_expert_used * d)?,
             att_m: nb(hp.n_head * max_ctx.div_ceil(ATTN_SPLIT_MIN))?,
             att_l: nb(hp.n_head * max_ctx.div_ceil(ATTN_SPLIT_MIN))?,
@@ -1259,7 +1274,14 @@ impl MetalModel {
     /// After a token-parallel conv of `nt` > 1 tokens: shifts the batch's last inputs into the
     /// history. Must come after every dispatch that reads the old history (no-op for one token,
     /// where the sequential kernels update it themselves).
-    fn conv_hist(&self, e: &mut Encoder, x: &Buffer, hist: &Buffer, ch: usize, nt: usize) -> Result<()> {
+    fn conv_hist(
+        &self,
+        e: &mut Encoder,
+        x: &Buffer,
+        hist: &Buffer,
+        ch: usize,
+        nt: usize,
+    ) -> Result<()> {
         if nt == 1 {
             return Ok(());
         }
@@ -1534,8 +1556,6 @@ impl MetalModel {
             (1, 1, 1),
             (hp.n_expert, 1, 1),
         )?;
-        // a single expert can receive at most one pair per token
-        let max_pairs = nt;
         let gm = MoeGemmArgs {
             n_embd: d as u32,
             n_ff: hp.n_ff_exp as u32,
@@ -1543,42 +1563,56 @@ impl MetalModel {
             situ_beta: hp.situ_beta,
             situ_lin: hp.situ_linear_beta,
         };
-        e.dispatch(
-            &self.tile(&format!("moe_gemm2_gate_up_{}", lw.exp_kind)),
-            &[
-                buf_at(&self.w, lw.gate_up.0),
-                buf(&a.n),
-                buf(&a.grp_count),
-                buf(&a.grp_offset),
-                buf(&a.grp_pairs),
-                buf(&a.act),
-                bytes(&gm),
-            ],
-            (
-                hp.n_ff_exp.div_ceil(GEMM_BM2),
-                max_pairs.div_ceil(GEMM_BN),
-                hp.n_expert,
-            ),
-            (128, 1, 1),
-        )?;
-        e.dispatch(
-            &self.tile(&format!("moe_gemm2_down_{}", lw.exp_kind)),
-            &[
-                buf_at(&self.w, lw.down.0),
-                buf(&a.act),
-                buf(&a.grp_count),
-                buf(&a.grp_offset),
-                buf(&a.grp_pairs),
-                buf(&a.yp),
-                bytes(&gm),
-            ],
-            (
-                d.div_ceil(GEMM_BM2),
-                max_pairs.div_ceil(GEMM_BN),
-                hp.n_expert,
-            ),
-            (128, 1, 1),
-        )?;
+        {
+            // routing is uneven, so each expert gets full 32-pair tiles plus one 32- or 16-pair tile
+            // for its remainder, listed by moe_tiles (63% -> ~80% of the tiles' pair slots used)
+            let max32 = n_pairs / 32 + hp.n_expert;
+            let max16 = hp.n_expert;
+            e.dispatch(
+                "moe_tiles",
+                &[
+                    buf(&a.grp_count),
+                    buf(&a.tiles32),
+                    buf(&a.tiles16),
+                    buf(&a.tile_counts),
+                    bytes(&TileArgs {
+                        n_expert: hp.n_expert as u32,
+                        max32: max32 as u32,
+                        max16: max16 as u32,
+                    }),
+                ],
+                (1, 1, 1),
+                (hp.n_expert, 1, 1),
+            )?;
+            for (kernel, w, src, dst, rows) in [
+                ("moe_tgemm_gate_up", lw.gate_up.0, &a.n, &a.act, hp.n_ff_exp),
+                ("moe_tgemm_down", lw.down.0, &a.act, &a.yp, d),
+            ] {
+                e.parallel(|e| {
+                    for (list, cnt_off, tn, cap) in
+                        [(&a.tiles32, 0usize, 32, max32), (&a.tiles16, 1, 16, max16)]
+                    {
+                        e.dispatch(
+                            &format!("{}_t{tn}", self.tile(&format!("{kernel}_{}", lw.exp_kind))),
+                            &[
+                                buf_at(&self.w, w),
+                                buf(src),
+                                buf(&a.grp_count),
+                                buf(&a.grp_offset),
+                                buf(&a.grp_pairs),
+                                buf(dst),
+                                bytes(&gm),
+                                buf(list),
+                                buf_at(&a.tile_counts, cnt_off * 4),
+                            ],
+                            (rows / GEMM_BM2, cap, 1),
+                            (128, 1, 1),
+                        )?;
+                    }
+                    Ok(())
+                })?;
+            }
+        }
         e.dispatch(
             "moe_combine",
             &[

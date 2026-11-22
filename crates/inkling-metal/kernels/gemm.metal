@@ -172,11 +172,10 @@ kernel void gemm_f32(device const float *W [[buffer(0)]], device const float *x 
 }
 
 // ---- MoE prefill GEMMs ------------------------------------------------------------------------
-// gate_up: act[pair] = situ(GateUp_e x[token(pair)]); down: yp[pair] = Down_e act[pair], for the
-// pairs moe_group routed to expert e. Each simdgroup owns a 32-row x 16-token output (4x2
-// accumulators), so a k step does 6 threadgroup-matrix loads per 8 multiplies (a 16x16 layout
-// does 4 per 4). Threadgroup memory is one raw array: the weight/activation
-// tiles during the k loop, then the f32 output tiles in the epilogue (32 KB limit).
+// 64-row tiles: each simdgroup owns a 32-row x 16-token output (4x2 accumulators), so a k step
+// does 6 threadgroup-matrix loads per 8 multiplies (a 16x16 layout does 4 per 4). Threadgroup
+// memory is one raw array: the weight/activation tiles during the k loop, then the f32 output
+// tiles in the epilogue (32 KB limit).
 
 #define BM2 64
 
@@ -199,127 +198,6 @@ inline void store_4x2(thread simdgroup_float8x8 acc[4][2], threadgroup float *Ct
         for (uint j = 0; j < 2; ++j) simdgroup_store(acc[i][j], Ct + (rb + 8 * i) * BN + tb + 8 * j, BN);
 }
 
-// Grid: (ceil(n_ff/BM2), ceil(max_pairs/BN), n_expert), 128 threads.
-template <typename B, typename E>
-kernel void moe_gemm2_gate_up(device const B *W [[buffer(0)]], device const float *x [[buffer(1)]], device const uint *count [[buffer(2)]],
-                              device const uint *offset [[buffer(3)]], device const uint *pairs [[buffer(4)]], device float *act [[buffer(5)]],
-                              constant MoeGemmArgs &a [[buffer(6)]], uint3 tg [[threadgroup_position_in_grid]],
-                              uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
-    uint e = tg.z;
-    uint n = count[e];
-    uint p0 = tg.y * BN;
-    if (p0 >= n) return;
-    threadgroup float tab[16];
-    // k loop: Gt [BM2][BK], Ut [BM2][BK], Xt [BN][BK] (E); epilogue: Cg, Cu [BM2][BN] (f32) over Gt/Ut
-    threadgroup uchar smem[2 * BM2 * BN * sizeof(float) + BN * BK * sizeof(float)];
-    threadgroup E *Gt = (threadgroup E *)smem;
-    threadgroup E *Ut = Gt + BM2 * BK;
-    threadgroup E *Xt = (threadgroup E *)(smem + 2 * BM2 * BN * sizeof(float));
-    if (tid < 16) tab[tid] = IQ4_NL_VALUES[tid];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    uint i0 = tg.x * BM2;
-    uint nb = a.n_embd / QK;
-    device const B *Ex = W + (ulong)e * 2 * a.n_ff * nb;
-    simdgroup_float8x8 ag[4][2], au[4][2];
-    for (uint i = 0; i < 4; ++i)
-        for (uint j = 0; j < 2; ++j) { ag[i][j] = simdgroup_float8x8(0); au[i][j] = simdgroup_float8x8(0); }
-
-    uint wr = tid / 2, wh = tid % 2;       // weight loads: 64 rows x 2 halves (2 parts of 8 each)
-    uint xr = tid / 4, xp = tid % 4;       // activation loads: 32 tokens x 4 parts of 8
-    uint fi = i0 + wr;
-    uint pi = p0 + xr;
-    uint tok = pi < n ? pairs[offset[e] + pi] / a.n_used : 0;
-    for (uint b = 0; b < nb; ++b) {
-        for (uint q = 0; q < 2; ++q) {
-            uint part = wh * 2 + q;
-            if (fi < a.n_ff) {
-                deq_block(Ex + (ulong)fi * nb, b, Gt + wr * BK, part, tab);
-                deq_block(Ex + (ulong)(a.n_ff + fi) * nb, b, Ut + wr * BK, part, tab);
-            } else {
-                for (uint j = 0; j < 8; ++j) { Gt[wr * BK + part * 8 + j] = E(0); Ut[wr * BK + part * 8 + j] = E(0); }
-            }
-        }
-        for (uint j = 0; j < 8; ++j) Xt[xr * BK + xp * 8 + j] = E(pi < n ? x[(ulong)tok * a.n_embd + b * QK + xp * 8 + j] : 0.0f);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        mma_4x2(Gt, Xt, ag, sg);
-        mma_4x2(Ut, Xt, au, sg);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    threadgroup float *Cg = (threadgroup float *)smem;
-    threadgroup float *Cu = Cg + BM2 * BN;
-    store_4x2(ag, Cg, sg);
-    store_4x2(au, Cu, sg);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint k = tid; k < BM2 * BN; k += 128) {
-        uint rr = k / BN, cc = k % BN;
-        uint f = i0 + rr, p = p0 + cc;
-        if (f >= a.n_ff || p >= n) continue;
-        float g = Cg[k], u = Cu[k];
-        act[(ulong)pairs[offset[e] + p] * a.n_ff + f] = softcapf(g, a.situ_beta) * sigmoidf(g) * softcapf(u, a.situ_lin);
-    }
-}
-
-// Grid: (ceil(n_embd/BM2), ceil(max_pairs/BN), n_expert), 128 threads.
-template <typename B, typename E>
-kernel void moe_gemm2_down(device const B *W [[buffer(0)]], device const float *act [[buffer(1)]], device const uint *count [[buffer(2)]],
-                           device const uint *offset [[buffer(3)]], device const uint *pairs [[buffer(4)]], device float *yp [[buffer(5)]],
-                           constant MoeGemmArgs &a [[buffer(6)]], uint3 tg [[threadgroup_position_in_grid]],
-                           uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
-    uint e = tg.z;
-    uint n = count[e];
-    uint p0 = tg.y * BN;
-    if (p0 >= n) return;
-    threadgroup float tab[16];
-    // k loop: Wt [BM2][BK], Xt [BN][BK] (E); epilogue: Ct [BM2][BN] (f32) over Wt
-    threadgroup uchar smem[BM2 * BN * sizeof(float) + BN * BK * sizeof(float)];
-    threadgroup E *Wt = (threadgroup E *)smem;
-    threadgroup E *Xt = (threadgroup E *)(smem + BM2 * BN * sizeof(float));
-    if (tid < 16) tab[tid] = IQ4_NL_VALUES[tid];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    uint r0 = tg.x * BM2;
-    uint nb = a.n_ff / QK;
-    device const B *Ex = W + (ulong)e * a.n_embd * nb;
-    simdgroup_float8x8 acc[4][2];
-    for (uint i = 0; i < 4; ++i)
-        for (uint j = 0; j < 2; ++j) acc[i][j] = simdgroup_float8x8(0);
-    uint wr = tid / 2, wh = tid % 2;
-    uint xr = tid / 4, xp = tid % 4;
-    uint row = r0 + wr;
-    uint pi = p0 + xr;
-    uint pair = pi < n ? pairs[offset[e] + pi] : 0;
-    for (uint b = 0; b < nb; ++b) {
-        for (uint q = 0; q < 2; ++q) {
-            uint part = wh * 2 + q;
-            if (row < a.n_embd) deq_block(Ex + (ulong)row * nb, b, Wt + wr * BK, part, tab);
-            else for (uint j = 0; j < 8; ++j) Wt[wr * BK + part * 8 + j] = E(0);
-        }
-        for (uint j = 0; j < 8; ++j) Xt[xr * BK + xp * 8 + j] = E(pi < n ? act[(ulong)pair * a.n_ff + b * QK + xp * 8 + j] : 0.0f);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        mma_4x2(Wt, Xt, acc, sg);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    threadgroup float *Ct = (threadgroup float *)smem;
-    store_4x2(acc, Ct, sg);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint k = tid; k < BM2 * BN; k += 128) {
-        uint rr = k / BN, cc = k % BN;
-        uint r = r0 + rr, p = p0 + cc;
-        if (r >= a.n_embd || p >= n) continue;
-        yp[(ulong)pairs[offset[e] + p] * a.n_embd + r] = Ct[k];
-    }
-}
-
-#define MOE_GEMM2_INSTANCES(T, E, name)                                                                                                  \
-    template [[host_name("moe_gemm2_gate_up_" name)]] kernel void moe_gemm2_gate_up<T, E>(                                               \
-        device const T *, device const float *, device const uint *, device const uint *, device const uint *, device float *,           \
-        constant MoeGemmArgs &, uint3, uint, uint);                                                                                       \
-    template [[host_name("moe_gemm2_down_" name)]] kernel void moe_gemm2_down<T, E>(                                                     \
-        device const T *, device const float *, device const uint *, device const uint *, device const uint *, device float *,           \
-        constant MoeGemmArgs &, uint3, uint, uint);
-MOE_GEMM2_INSTANCES(block_iq4_nl, half, "iq4_nl_f16")
-MOE_GEMM2_INSTANCES(block_q8_0, half, "q8_0_f16")
-MOE_GEMM2_INSTANCES(block_iq4_nl, float, "iq4_nl_f32")
-MOE_GEMM2_INSTANCES(block_q8_0, float, "q8_0_f32")
 
 // ---- several Q8_0 matrices sharing one input, 64-row tiles ---------------------------------------
 // out_s[t][r] = W_s[r] . x[t] for several Q8_0 matrices sharing one input (segment concatenation
@@ -380,3 +258,173 @@ kernel void gemm2_q8_0_multi(device const uchar *W [[buffer(0)]], device const f
         device float *, device float *, device float *, constant GMultiArgs &, uint2, uint, uint);
 MULTI2_INSTANCE(half, "f16")
 MULTI2_INSTANCE(float, "f32")
+
+// ---- MoE GEMMs over a tile list, 32- or 16-pair tiles ---------------------------------------------
+// Routing is uneven (512-token batch: median 18 pairs per expert, max 180), so one-size 32-pair
+// tiles run 63% full. moe_tiles lists full 32-pair tiles per expert plus one tile for the
+// remainder: 32-wide if more than 16 pairs are left, 16-wide otherwise. Each kernel instance reads
+// (expert, first pair) from its list; threadgroups past the list's length exit at once.
+
+struct TileArgs {
+    uint n_expert;
+    uint max32;  // list capacities
+    uint max16;
+};
+
+// One threadgroup of n_expert threads. counts[0] / counts[1] = tiles in list32 / list16.
+kernel void moe_tiles(device const uint *count [[buffer(0)]], device uint2 *list32 [[buffer(1)]], device uint2 *list16 [[buffer(2)]],
+                      device uint *counts [[buffer(3)]], constant TileArgs &a [[buffer(4)]], uint e [[thread_position_in_threadgroup]]) {
+    threadgroup uint n32[1024], n16[1024];
+    uint n = e < a.n_expert ? count[e] : 0;
+    uint rem = n % 32;
+    uint t32 = n / 32 + (rem > 16 ? 1 : 0), t16 = (rem > 0 && rem <= 16) ? 1 : 0;
+    n32[e] = t32;
+    n16[e] = t16;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (e >= a.n_expert) return;
+    uint o32 = 0, o16 = 0;
+    for (uint i = 0; i < e; ++i) { o32 += n32[i]; o16 += n16[i]; }
+    for (uint t = 0; t < t32; ++t) list32[o32 + t] = uint2(e, t * 32);
+    if (t16) list16[o16] = uint2(e, n - rem);
+    if (e == a.n_expert - 1) { counts[0] = o32 + t32; counts[1] = o16 + t16; }
+}
+
+// C[64 rows][TN pairs] += W x^T for one 32-column step; simdgroup sg owns rows (sg/2)*32.. and pairs
+// (sg%2)*(TN/2).., i.e. a 4 x (TN/16) block of 8x8 accumulators.
+template <typename E, uint TN>
+inline void mma_4xj(threadgroup const E *Wt, threadgroup const E *Xt, thread simdgroup_float8x8 acc[4][TN / 16], uint sg) {
+    typedef typename metal::conditional<metal::is_same<E, half>::value, simdgroup_half8x8, simdgroup_float8x8>::type Mat;
+    uint rb = (sg / 2) * 32, tb = (sg % 2) * (TN / 2);
+    for (uint kk = 0; kk < BK; kk += 8) {
+        Mat a[4], b[TN / 16];
+        for (uint i = 0; i < 4; ++i) simdgroup_load(a[i], Wt + (rb + 8 * i) * BK + kk, BK);
+        for (uint j = 0; j < TN / 16; ++j) simdgroup_load(b[j], Xt + (tb + 8 * j) * BK + kk, BK, ulong2(0, 0), true);
+        for (uint i = 0; i < 4; ++i)
+            for (uint j = 0; j < TN / 16; ++j) simdgroup_multiply_accumulate(acc[i][j], a[i], b[j], acc[i][j]);
+    }
+}
+
+template <uint TN>
+inline void store_4xj(thread simdgroup_float8x8 acc[4][TN / 16], threadgroup float *Ct, uint sg) {
+    uint rb = (sg / 2) * 32, tb = (sg % 2) * (TN / 2);
+    for (uint i = 0; i < 4; ++i)
+        for (uint j = 0; j < TN / 16; ++j) simdgroup_store(acc[i][j], Ct + (rb + 8 * i) * TN + tb + 8 * j, TN);
+}
+
+// Grid: (n_ff / 64, list capacity), 128 threads.
+template <typename B, typename E, uint TN>
+kernel void moe_tgemm_gate_up(device const B *W [[buffer(0)]], device const float *x [[buffer(1)]], device const uint *count [[buffer(2)]],
+                              device const uint *offset [[buffer(3)]], device const uint *pairs [[buffer(4)]], device float *act [[buffer(5)]],
+                              constant MoeGemmArgs &a [[buffer(6)]], device const uint2 *list [[buffer(7)]], device const uint *n_tiles [[buffer(8)]],
+                              uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                              uint sg [[simdgroup_index_in_threadgroup]]) {
+    if (tg.y >= n_tiles[0]) return;
+    uint e = list[tg.y].x, p0 = list[tg.y].y;
+    uint n = count[e];
+    threadgroup float tab[16];
+    // k loop: Gt, Ut [BM2][BK] then Xt [TN][BK]; epilogue: Cg, Cu [BM2][TN] f32 over Gt/Ut (TN <= BK)
+    threadgroup uchar smem[2 * BM2 * BK * sizeof(float) + TN * BK * sizeof(float)];
+    threadgroup E *Gt = (threadgroup E *)smem;
+    threadgroup E *Ut = Gt + BM2 * BK;
+    threadgroup E *Xt = (threadgroup E *)(smem + 2 * BM2 * BK * sizeof(float));
+    if (tid < 16) tab[tid] = IQ4_NL_VALUES[tid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint i0 = tg.x * BM2;
+    uint nb = a.n_embd / QK;
+    device const B *Ex = W + (ulong)e * 2 * a.n_ff * nb;
+    simdgroup_float8x8 ag[4][TN / 16], au[4][TN / 16];
+    for (uint i = 0; i < 4; ++i)
+        for (uint j = 0; j < TN / 16; ++j) { ag[i][j] = simdgroup_float8x8(0); au[i][j] = simdgroup_float8x8(0); }
+    uint wr = tid / 2, wh = tid % 2;            // weights: 64 rows x 2 halves (2 parts of 8 each)
+    constexpr uint XPT = TN * BK / 128;         // input elements per thread
+    uint xr = tid / (BK / XPT), xc = (tid % (BK / XPT)) * XPT;
+    uint pi = p0 + xr;
+    uint tok = pi < n ? pairs[offset[e] + pi] / a.n_used : 0;
+    uint fi = i0 + wr;
+    for (uint b = 0; b < nb; ++b) {
+        for (uint q = 0; q < 2; ++q) {
+            uint part = wh * 2 + q;
+            deq_block(Ex + (ulong)fi * nb, b, Gt + wr * BK, part, tab);
+            deq_block(Ex + (ulong)(a.n_ff + fi) * nb, b, Ut + wr * BK, part, tab);
+        }
+        for (uint j = 0; j < XPT; ++j) Xt[xr * BK + xc + j] = E(pi < n ? x[(ulong)tok * a.n_embd + b * QK + xc + j] : 0.0f);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        mma_4xj<E, TN>(Gt, Xt, ag, sg);
+        mma_4xj<E, TN>(Ut, Xt, au, sg);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    threadgroup float *Cg = (threadgroup float *)smem;
+    threadgroup float *Cu = Cg + BM2 * TN;
+    store_4xj<TN>(ag, Cg, sg);
+    store_4xj<TN>(au, Cu, sg);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint k = tid; k < BM2 * TN; k += 128) {
+        uint rr = k / TN, cc = k % TN;
+        uint p = p0 + cc;
+        if (p >= n) continue;
+        float g = Cg[k], u = Cu[k];
+        act[(ulong)pairs[offset[e] + p] * a.n_ff + i0 + rr] = softcapf(g, a.situ_beta) * sigmoidf(g) * softcapf(u, a.situ_lin);
+    }
+}
+
+// Grid: (n_embd / 64, list capacity), 128 threads.
+template <typename B, typename E, uint TN>
+kernel void moe_tgemm_down(device const B *W [[buffer(0)]], device const float *act [[buffer(1)]], device const uint *count [[buffer(2)]],
+                           device const uint *offset [[buffer(3)]], device const uint *pairs [[buffer(4)]], device float *yp [[buffer(5)]],
+                           constant MoeGemmArgs &a [[buffer(6)]], device const uint2 *list [[buffer(7)]], device const uint *n_tiles [[buffer(8)]],
+                           uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                           uint sg [[simdgroup_index_in_threadgroup]]) {
+    if (tg.y >= n_tiles[0]) return;
+    uint e = list[tg.y].x, p0 = list[tg.y].y;
+    uint n = count[e];
+    threadgroup float tab[16];
+    // k loop: Wt [BM2][BK] then Xt [TN][BK]; epilogue: Ct [BM2][TN] f32 over Wt (TN <= BK)
+    threadgroup uchar smem[BM2 * BK * sizeof(float) + TN * BK * sizeof(float)];
+    threadgroup E *Wt = (threadgroup E *)smem;
+    threadgroup E *Xt = (threadgroup E *)(smem + BM2 * BK * sizeof(float));
+    if (tid < 16) tab[tid] = IQ4_NL_VALUES[tid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint r0 = tg.x * BM2;
+    uint nb = a.n_ff / QK;
+    device const B *Ex = W + (ulong)e * a.n_embd * nb;
+    simdgroup_float8x8 acc[4][TN / 16];
+    for (uint i = 0; i < 4; ++i)
+        for (uint j = 0; j < TN / 16; ++j) acc[i][j] = simdgroup_float8x8(0);
+    uint wr = tid / 2, wh = tid % 2;
+    constexpr uint XPT = TN * BK / 128;
+    uint xr = tid / (BK / XPT), xc = (tid % (BK / XPT)) * XPT;
+    uint pi = p0 + xr;
+    uint pair = pi < n ? pairs[offset[e] + pi] : 0;
+    uint row = r0 + wr;
+    for (uint b = 0; b < nb; ++b) {
+        for (uint q = 0; q < 2; ++q) deq_block(Ex + (ulong)row * nb, b, Wt + wr * BK, wh * 2 + q, tab);
+        for (uint j = 0; j < XPT; ++j) Xt[xr * BK + xc + j] = E(pi < n ? act[(ulong)pair * a.n_ff + b * QK + xc + j] : 0.0f);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        mma_4xj<E, TN>(Wt, Xt, acc, sg);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    threadgroup float *Ct = (threadgroup float *)smem;
+    store_4xj<TN>(acc, Ct, sg);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint k = tid; k < BM2 * TN; k += 128) {
+        uint rr = k / TN, cc = k % TN;
+        uint p = p0 + cc;
+        if (p < n) yp[(ulong)pairs[offset[e] + p] * a.n_embd + r0 + rr] = Ct[k];
+    }
+}
+
+#define MOE_TGEMM_INSTANCES(T, E, name, TN)                                                                                              \
+    template [[host_name("moe_tgemm_gate_up_" name "_t" #TN)]] kernel void moe_tgemm_gate_up<T, E, TN>(                                \
+        device const T *, device const float *, device const uint *, device const uint *, device const uint *, device float *,           \
+        constant MoeGemmArgs &, device const uint2 *, device const uint *, uint2, uint, uint);                                            \
+    template [[host_name("moe_tgemm_down_" name "_t" #TN)]] kernel void moe_tgemm_down<T, E, TN>(                                      \
+        device const T *, device const float *, device const uint *, device const uint *, device const uint *, device float *,           \
+        constant MoeGemmArgs &, device const uint2 *, device const uint *, uint2, uint, uint);
+MOE_TGEMM_INSTANCES(block_iq4_nl, half, "iq4_nl_f16", 32)
+MOE_TGEMM_INSTANCES(block_iq4_nl, half, "iq4_nl_f16", 16)
+MOE_TGEMM_INSTANCES(block_q8_0, half, "q8_0_f16", 32)
+MOE_TGEMM_INSTANCES(block_q8_0, half, "q8_0_f16", 16)
+MOE_TGEMM_INSTANCES(block_iq4_nl, float, "iq4_nl_f32", 32)
+MOE_TGEMM_INSTANCES(block_iq4_nl, float, "iq4_nl_f32", 16)
+MOE_TGEMM_INSTANCES(block_q8_0, float, "q8_0_f32", 32)
+MOE_TGEMM_INSTANCES(block_q8_0, float, "q8_0_f32", 16)

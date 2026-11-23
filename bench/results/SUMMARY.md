@@ -140,3 +140,4 @@ Decode with every non-weight kernel skipped (INKLING_SKIP, timing bound only) ru
 - tried, no gain, reverted: two-pass argmax (the single-threadgroup argmax was cheap; the doubling estimate of 0.8 ms was noise), single-simdgroup top-k.
 
 `bench/ab.sh 025ece2 2`: tg128 44.90 / 42.69 vs 43.31 / 41.37 (+3-4%), tg128 @ 4096 37.73 / 37.66 vs 37.17 / 36.29. Prefill is untouched by these commits; its swings here are throttling (round 2 ran hot for both builds).
+- RMS norm fused into the decode attention projections (mv_q8_0_multi_rms): no gain in an A/B (tg128 45.27 / 41.92 vs 45.17 / 43.31), reverted. The three norms already ran concurrently with one barrier per layer pass, so there was little to remove.

@@ -13,3 +13,6 @@ inkling = { path = "../inkling" }
 inkling-metal = { path = "../inkling-metal" }
 gguf = { path = "../gguf" }
 anyhow.workspace = true
+# preserve_order: tool call arguments keep the client's key order inside nested values, as the
+# template's tojson does
+serde_json = { workspace = true, features = ["preserve_order"] }

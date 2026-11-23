@@ -1,5 +1,8 @@
 //! inkling run   -m model.gguf -p "prompt" [-n 64] [--chat] [--temp T --seed S] [--backend metal|cpu]
+//! inkling serve -m model.gguf [--port 8080] [--ctx 65536]   (OpenAI-compatible, see serve.rs)
 //! inkling bench -m model.gguf [--pp 512] [--tg 128] [-r 5] [--backend metal|cpu] [--json out.json]
+
+mod serve;
 
 use std::io::Write;
 use std::time::Instant;
@@ -40,6 +43,7 @@ struct Args {
 
 const USAGE: &str = "usage:
   inkling run   -m <model.gguf> -p <prompt> [-f file] [-n N] [--chat] [--temp T] [--seed S] [--backend metal|cpu] [--draft <native dir>]
+  inkling serve -m <model.gguf> [--port 8080] [--ctx 65536] [--effort 0.9] [--log file.jsonl]
   inkling bench -m <model.gguf> [--pp 512] [--tg 128] [-r 5] [-d depth] [--backend metal|cpu] [--json out.json] [--draft <native dir>]
 
   --draft: speculative greedy decoding with the DSpark drafter from the native checkpoint
@@ -248,7 +252,7 @@ fn run(args: &Args, g: &gguf::Gguf, hp: &Hparams) -> Result<()> {
     let mut n = 0;
     let mut pending: Vec<u8> = Vec::new();
     // tokens can end mid UTF-8 sequence; print only complete characters
-    let mut emit = |out: &mut std::io::StdoutLock, pending: &mut Vec<u8>, t: u32| -> Result<()> {
+    let emit = |out: &mut std::io::StdoutLock, pending: &mut Vec<u8>, t: u32| -> Result<()> {
         pending.extend(tok.token_bytes(t));
         let valid = match std::str::from_utf8(pending) {
             Ok(_) => pending.len(),
@@ -448,6 +452,9 @@ fn bench(args: &Args, g: &gguf::Gguf, hp: &Hparams) -> Result<()> {
 }
 
 fn main() -> Result<()> {
+    if std::env::args().nth(1).as_deref() == Some("serve") {
+        return serve::serve(serve::parse(std::env::args().skip(2))?);
+    }
     let args = parse()?;
     let g = gguf::Gguf::open(&args.model)?;
     let hp = Hparams::from_gguf(&g)?;

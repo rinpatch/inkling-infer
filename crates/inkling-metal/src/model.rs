@@ -455,6 +455,12 @@ fn opt(g: &Gguf, name: &str, want: DType) -> Result<Option<T>> {
     }
 }
 
+/// Per-sequence state at a position (see `MetalModel::save_state`).
+pub struct SeqState {
+    pub pos: usize,
+    conv: Vec<f32>,
+}
+
 /// Construction options.
 #[derive(Debug, Clone, Copy)]
 pub struct Options {
@@ -721,6 +727,39 @@ impl MetalModel {
 
     pub fn pos(&self) -> usize {
         self.pos
+    }
+
+    pub fn max_ctx(&self) -> usize {
+        self.max_ctx
+    }
+
+    /// Snapshot of the sequence state at the current position: the conv histories. KV rows are not
+    /// copied, so a snapshot stays valid only while no row below its `pos` is rewritten.
+    pub fn save_state(&self) -> SeqState {
+        let mut conv = Vec::new();
+        for s in &self.slots {
+            for c in &s.conv {
+                conv.extend_from_slice(c.as_slice::<f32>());
+            }
+        }
+        SeqState {
+            pos: self.pos,
+            conv,
+        }
+    }
+
+    /// Returns to a snapshot from `save_state`, dropping everything after its position.
+    pub fn load_state(&mut self, st: &SeqState) {
+        self.pos = st.pos;
+        self.dr_set_len(0);
+        let mut off = 0;
+        for s in &self.slots {
+            for c in &s.conv {
+                let dst = c.as_mut_slice::<f32>();
+                dst.copy_from_slice(&st.conv[off..off + dst.len()]);
+                off += dst.len();
+            }
+        }
     }
 
     /// Starts a new sequence. KV rows past `pos` are never read, so only the conv histories need

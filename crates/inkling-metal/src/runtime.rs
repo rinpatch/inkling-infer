@@ -330,6 +330,15 @@ unsafe extern "C" {
     fn mach_timebase_info(info: *mut MachTimebase) -> i32;
 }
 
+fn empty_prefixes() -> &'static [String] {
+    static P: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    P.get_or_init(|| {
+        std::env::var("INKLING_EMPTY")
+            .map(|v| v.split(',').filter(|s| !s.is_empty()).map(str::to_string).collect())
+            .unwrap_or_default()
+    })
+}
+
 fn skip_prefixes() -> &'static [String] {
     static P: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     P.get_or_init(|| {
@@ -416,6 +425,10 @@ impl Encoder<'_> {
         {
             return Ok(());
         }
+        // INKLING_EMPTY=<prefix>[,...]: run an empty kernel with the same grid in place of matching
+        // ones, separating fixed dispatch/barrier cost from kernel work (timing only)
+        let kernel = if empty_prefixes().iter().any(|p| kernel.starts_with(p.as_str())) { "empty_probe" } else { kernel };
+        let args: &[Arg] = if kernel == "empty_probe" { &[] } else { args };
         let p = self.ctx.pipeline(kernel)?;
         // a kernel's register use can lower its thread limit below what the caller dispatches;
         // Metal would then not run it correctly, without any error

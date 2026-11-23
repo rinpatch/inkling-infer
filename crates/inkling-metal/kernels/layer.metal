@@ -1006,3 +1006,6 @@ template [[host_name("attn_short_f32")]] kernel void attn_short<float>(device co
 template [[host_name("attn_short_f16")]] kernel void attn_short<half>(device const float *, device const half *, device const half *,
                                                                        device const float *, device const float *, device const float *,
                                                                        device float *, device float *, constant SplitArgs &, uint, uint);
+
+// Timing probe (runtime INKLING_EMPTY): stands in for a kernel with the same grid and barriers.
+kernel void empty_probe(uint gid [[thread_position_in_grid]]) {}

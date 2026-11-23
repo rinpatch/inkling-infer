@@ -145,4 +145,4 @@ Decode with every non-weight kernel skipped (INKLING_SKIP, timing bound only) ru
 - 32-pair gate_up tiles with 8 simdgroups (2x2 accumulators per matrix instead of 4x2): correct but slower, pp512 429 vs 444. The 4x2 layout's higher multiplies-per-load ratio matters more than its register use. Together with the 64-pair and 64-column-step results, the current MoE tile shape looks like a local optimum.
 - Decode loop-gate matrices in f16 (104a6e3): +1.5%, kept (quality in its commit message).
 - FFN RMS norm folded into the decode router and expert gate/up kernels: correct but slower (tg128 45.35 vs 46.5); every gate/up threadgroup recomputing the norm costs more than the dependent dispatch it removes. Reverted.
-- Router weights to f16: not tried; ~57 MB per token, so at most ~0.5%, with the risk landing on near-tied routing.
+- Router weights to f16 for decode: tg128 46.73 / 46.78 / 46.60 vs 46.40 / 46.79 / 46.44 (~+0.3%, within noise); not worth a lossy change on the routing path. Reverted.

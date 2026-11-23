@@ -247,21 +247,64 @@ fn run(args: &Args, g: &gguf::Gguf, hp: &Hparams) -> Result<()> {
     let t1 = Instant::now();
     let mut n = 0;
     let mut pending: Vec<u8> = Vec::new();
-    for _ in 0..args.n_gen {
-        let next = sample(&logits, args.temp, &mut rng);
-        n += 1;
-        if next == tok.eos {
-            break;
-        }
-        // tokens can end mid UTF-8 sequence; print only complete characters
-        pending.extend(tok.token_bytes(next));
-        let valid = match std::str::from_utf8(&pending) {
+    // tokens can end mid UTF-8 sequence; print only complete characters
+    let mut emit = |out: &mut std::io::StdoutLock, pending: &mut Vec<u8>, t: u32| -> Result<()> {
+        pending.extend(tok.token_bytes(t));
+        let valid = match std::str::from_utf8(pending) {
             Ok(_) => pending.len(),
             Err(e) => e.valid_up_to(),
         };
         out.write_all(&pending[..valid])?;
         out.flush()?;
         pending.drain(..valid);
+        Ok(())
+    };
+    if let (true, Engine::Metal(m)) = (args.temp <= 0.0, &mut eng) {
+        // greedy on Metal: the pick stays on the GPU and steps queue back to back
+        // (decode_greedy); chunks of 16 keep the output streaming and let EOS stop it
+        let mut next = sample(&logits, 0.0, &mut rng);
+        while n < args.n_gen && next != tok.eos {
+            emit(&mut out, &mut pending, next)?;
+            n += 1;
+            let chunk = 16.min(args.n_gen - n);
+            if chunk == 0 {
+                break;
+            }
+            let got = m.decode_greedy(next, chunk)?;
+            for &t in &got[..chunk - 1] {
+                if t == tok.eos {
+                    next = t;
+                    break;
+                }
+                emit(&mut out, &mut pending, t)?;
+                n += 1;
+            }
+            if next == tok.eos {
+                break;
+            }
+            next = got[chunk - 1];
+        }
+        out.write_all(&pending)?;
+        writeln!(out)?;
+        let t_gen = t1.elapsed().as_secs_f64();
+        eprintln!(
+            "prompt: {} tokens in {:.2}s ({:.2} tok/s) | gen: {} tokens in {:.2}s ({:.2} tok/s)",
+            ids.len(),
+            t_prompt,
+            ids.len() as f64 / t_prompt,
+            n,
+            t_gen,
+            n as f64 / t_gen
+        );
+        return Ok(());
+    }
+    for _ in 0..args.n_gen {
+        let next = sample(&logits, args.temp, &mut rng);
+        n += 1;
+        if next == tok.eos {
+            break;
+        }
+        emit(&mut out, &mut pending, next)?;
         logits = eng.step(next)?;
     }
     out.write_all(&pending)?;

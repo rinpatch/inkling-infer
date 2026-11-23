@@ -2236,20 +2236,26 @@ impl MetalModel {
             self.msg_gate(e, g, &a.m, 0, &a.msgs, 3 * plane, &a.m, 0, nt)?;
         }
         self.norm(e, &a.m, 0, Some(lw.ffn_norm), &a.n, 0, d, hp.rms_eps, nt)?;
-        e.dispatch(
-            "mv_f32_rowtg",
-            &[
-                buf_at(&self.w, lw.router.0),
-                buf(&a.n),
-                buf(&a.router_logits),
-                bytes(&MvArgs {
-                    rows: hp.n_expert as u32,
-                    cols: d as u32,
-                }),
-            ],
-            (hp.n_expert, nt, 1),
-            (256, 1, 1),
-        )?;
+        if nt > MAX_VERIFY {
+            // prefill: the router as an MMA GEMM; one threadgroup per (expert, token) re-read each
+            // weight row per token (~32 ms of a 512-token batch for 0.3 GFLOP)
+            self.gemm_f32(e, lw.router, &a.n, &a.router_logits, hp.n_expert, d, nt)?;
+        } else {
+            e.dispatch(
+                "mv_f32_rowtg",
+                &[
+                    buf_at(&self.w, lw.router.0),
+                    buf(&a.n),
+                    buf(&a.router_logits),
+                    bytes(&MvArgs {
+                        rows: hp.n_expert as u32,
+                        cols: d as u32,
+                    }),
+                ],
+                (hp.n_expert, nt, 1),
+                (256, 1, 1),
+            )?;
+        }
         rec(e, "ffn_moe_logits", s, &a.router_logits, 0, hp.n_expert)?;
         let Some(bias) = lw.exp_probs_b else {
             return Err(Error::Model(inkling::Error::Unsupported(

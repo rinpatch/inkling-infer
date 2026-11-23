@@ -130,3 +130,13 @@ Where it came from, measured by running each kernel family twice (INKLING_DOUBLE
 Tried and dropped: relative bias computed inside attn_tiled (pp4096 −12-15%); per-token message-gate kernels for batches (pp512 351 → 302); 64-pair tiles for busy experts (slower, 413 vs 443, and produced wrong results, not debugged).
 
 Updated standing against llama.cpp's best build (#32808, flash-attention bias, measured earlier today): pp512 378.4 vs ours ~441, pp4096 343.4 vs ~406, tg128 27.2 vs 43.4, tg128 @ 4K 26.1 vs 37.2.
+
+## Decode small ops (bc13788 vs 025ece2), 2026-11-23
+
+Decode with every non-weight kernel skipped (INKLING_SKIP, timing bound only) runs 65.3 tok/s, 96% of the roofline: the weight kernels are at the bandwidth limit, and the ~7 ms per token of small ops (about 1000 dispatches) is the remaining gap. Skip numbers are only trustworthy for kernels that don't feed routing: skipping moe_topk leaves the previous layer's experts selected (cache hits), which looked like a 1.4 ms saving that a faster top-k did not deliver.
+
+- depth mix split over the hidden dimension for up to 8 tokens (1dc6e4f): one threadgroup per token had one core read all block states, ~15 us x 120 calls. tg128 44.0 → 45.5.
+- one-pass decode attention for up to 256 visible keys (bc13788): ~+1%.
+- tried, no gain, reverted: two-pass argmax (the single-threadgroup argmax was cheap; the doubling estimate of 0.8 ms was noise), single-simdgroup top-k.
+
+`bench/ab.sh 025ece2 2`: tg128 44.90 / 42.69 vs 43.31 / 41.37 (+3-4%), tg128 @ 4096 37.73 / 37.66 vs 37.17 / 36.29. Prefill is untouched by these commits; its swings here are throttling (round 2 ran hot for both builds).

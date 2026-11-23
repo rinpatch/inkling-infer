@@ -6,3 +6,5 @@ bench/engines/*/
 .venv/
 tools/llama-dump/llama-dump
 fixtures/out/
+bench/swe/runs/*/*/
+bench/swe/runs/*/minisweagent.log

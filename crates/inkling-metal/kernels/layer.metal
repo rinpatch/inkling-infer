@@ -751,7 +751,17 @@ TILED_INSTANCE(half, half, "kv16_f16")
 struct ArgmaxArgs {
     uint n;
     uint out_index;
+    float inv_temp;  // 0: greedy
+    uint seed;
 };
+
+// Uniform in (0, 1) from a hash of (seed, i): PCG output function.
+inline float hash_uniform(uint seed, uint i) {
+    uint x = seed * 747796405u + i * 2891336453u + 1u;
+    x = ((x >> ((x >> 28u) + 4u)) ^ x) * 277803737u;
+    x = (x >> 22u) ^ x;
+    return (float(x >> 8) + 0.5f) * (1.0f / 16777216.0f);
+}
 
 // Greedy pick on the GPU: tokens[0] <- argmax(logits) (lowest index on ties), also stored at
 // out[out_index]. tokens[0] is what the next step's embedding lookup reads, so decode steps can be
@@ -765,6 +775,8 @@ kernel void argmax_token(device const float *logits [[buffer(0)]], device uint *
     uint idx = 0xffffffffu;
     for (uint i = tid; i < a.n; i += 1024) {
         float x = logits[i];
+        // Gumbel-max: argmax of logit / T + Gumbel noise is a sample from softmax(logit / T)
+        if (a.inv_temp > 0.0f) x = x * a.inv_temp - log(-log(hash_uniform(a.seed, i)));
         if (x > v) { v = x; idx = i; }
     }
     // reduce (value desc, index asc) within the simdgroup, then across simdgroups

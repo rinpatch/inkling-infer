@@ -200,8 +200,8 @@ fn speculative_matches_greedy() {
 }
 
 /// Sliding-window slots keep a bounded buffer and move their newest rows to the front when it
-/// fills. With no slack (INKLING_SWA_SLACK=0: 2560 rows, compacting every ~1500 tokens) prefill,
-/// pipelined decode and single steps must give exactly what an uncompacted cache gives.
+/// fills (2560 rows, compacting every ~1500 tokens). Prefill, pipelined decode and single steps
+/// must give exactly what an uncompacted cache (INKLING_SWA_FULL) gives.
 #[test]
 fn swa_compaction_matches_full_cache() {
     let Some(mp) = model_path() else {
@@ -227,11 +227,11 @@ fn swa_compaction_matches_full_cache() {
         kv_f16: true,
         gate_f16: true,
     };
-    // SAFETY: tests run one per process under nextest; nothing else reads the environment here
-    unsafe { std::env::set_var("INKLING_SWA_SLACK", "0") };
     let mut small = MetalModel::with_options(&g, hp.clone(), ctx, opts).unwrap();
-    unsafe { std::env::remove_var("INKLING_SWA_SLACK") };
+    // SAFETY: tests run one per process under nextest; nothing else reads the environment here
+    unsafe { std::env::set_var("INKLING_SWA_FULL", "1") };
     let mut full = MetalModel::with_options(&g, hp.clone(), ctx, opts).unwrap();
+    unsafe { std::env::remove_var("INKLING_SWA_FULL") };
 
     let a = small.prefill(&prompt).unwrap();
     let b = full.prefill(&prompt).unwrap();
@@ -244,4 +244,58 @@ fn swa_compaction_matches_full_cache() {
     let la = small.step(next, &mut inkling::NoTrace).unwrap();
     let lb = full.step(next, &mut inkling::NoTrace).unwrap();
     assert_eq!(la, lb, "step logits after compactions");
+}
+
+/// A snapshot carries its own sliding-window rows, so it restores after compactions have dropped
+/// them from the live buffers: the continuation must match an uncompacted cache that never left
+/// the snapshot's position.
+#[test]
+fn snapshot_restores_after_compaction() {
+    let Some(mp) = model_path() else {
+        eprintln!("SKIP: model not found");
+        return;
+    };
+    let toks = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/out/swa/tokens.txt"),
+    );
+    let Ok(toks) = toks else {
+        eprintln!("SKIP: fixtures/out/swa missing");
+        return;
+    };
+    let prompt: Vec<u32> = toks
+        .lines()
+        .map(|l| l.trim().parse().unwrap())
+        .take(3000)
+        .collect();
+    let g = gguf::Gguf::open(mp).unwrap();
+    let hp = Hparams::from_gguf(&g).unwrap();
+    let ctx = 4096;
+    let opts = Options {
+        kv_f16: true,
+        gate_f16: true,
+    };
+    let mut small = MetalModel::with_options(&g, hp.clone(), ctx, opts).unwrap();
+    // SAFETY: tests run one per process under nextest; nothing else reads the environment here
+    unsafe { std::env::set_var("INKLING_SWA_FULL", "1") };
+    let mut full = MetalModel::with_options(&g, hp.clone(), ctx, opts).unwrap();
+    unsafe { std::env::remove_var("INKLING_SWA_FULL") };
+
+    let p = 1200;
+    small.prefill(&prompt[..p]).unwrap();
+    let snap = small.save_state();
+    // Past 2560 rows the buffer compacts to the newest 1024 (base >= 1024), so the rows that
+    // position p needs (from p - 1024 = 176) are gone before the restore.
+    let l = small.prefill(&prompt[p..]).unwrap();
+    small.decode_greedy(argmax(&l), 300).unwrap();
+    small.load_state(&snap);
+    assert_eq!(small.pos(), p);
+
+    full.prefill(&prompt[..p]).unwrap();
+    let a = small.prefill(&prompt[p..2500]).unwrap();
+    let b = full.prefill(&prompt[p..2500]).unwrap();
+    assert_eq!(a, b, "prefill logits after restore");
+    let first = argmax(&a);
+    let ta = small.decode_greedy(first, 200).unwrap();
+    let tb = full.decode_greedy(first, 200).unwrap();
+    assert_eq!(ta, tb, "decode tokens after restore");
 }

@@ -1,11 +1,12 @@
 //! `inkling serve`: an OpenAI-compatible chat completions server (Metal, one sequence at a time).
 //!
 //! Requests queue for the single engine thread. Between requests the engine keeps its KV cache and
-//! the tokens behind it; a new prompt reuses the longest common prefix. KV rows are kept in place,
-//! so rewinding only needs the short-conv histories at the target position: the server snapshots
-//! them at every prompt end and every CHECKPOINT_EVERY prompt tokens, and resumes from the latest
-//! snapshot at or below the common prefix. Agent loops drop earlier turns' thinking from the
-//! history, so the reusable prefix usually ends exactly at the previous prompt's end.
+//! the tokens behind it; a new prompt reuses the longest common prefix. Full-attention KV rows stay
+//! in place, so rewinding needs the short-conv histories and the sliding-window rows at the target
+//! position: the server snapshots them (`SeqState`) at every prompt end and every CHECKPOINT_EVERY
+//! prompt tokens, and resumes from the latest snapshot at or below the common prefix. Agent loops
+//! either send the answer back verbatim or drop its thinking, so the reusable prefix usually ends
+//! at the previous prompt's end or past it.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -20,7 +21,8 @@ use inkling_metal::model::{MetalModel, SeqState};
 use serde_json::{Value, json};
 
 const CHECKPOINT_EVERY: usize = 4096;
-const MAX_CHECKPOINTS: usize = 24;
+/// A snapshot holds ~160 MiB of sliding-window rows; the oldest is evicted first.
+const MAX_CHECKPOINTS: usize = 4;
 /// Pipelined decoding (greedy or plain temperature sampling, picked on the GPU) runs this many
 /// steps per call; a stop is noticed at the end of a chunk, and the tokens after it are discarded.
 const PIPELINE_CHUNK: usize = 16;
@@ -492,7 +494,7 @@ impl Cache {
             match self
                 .snaps
                 .iter()
-                .filter(|s| s.pos <= target && m.can_restore(s))
+                .filter(|s| s.pos <= target)
                 .max_by_key(|s| s.pos)
             {
                 Some(s) => m.load_state(s),

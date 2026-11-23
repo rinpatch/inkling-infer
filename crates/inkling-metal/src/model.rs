@@ -263,17 +263,10 @@ const MOE_NR: usize = 2;
 pub const MAX_VERIFY: usize = 8;
 /// Visible keys up to which decode attention runs in one pass (kernels/layer.metal ATTN_SHORT).
 const ATTN_SHORT: usize = 256;
-/// Sliding-window slots keep only recent rows: when a batch would run past the buffer, the newest
-/// window + SWA_SLACK rows move to the front and `swa_base` advances. The slack keeps server
-/// snapshots from the last few thousand tokens restorable (`can_restore`).
-const SWA_SLACK: usize = 8192;
-
-/// INKLING_SWA_SLACK overrides SWA_SLACK (tests force frequent compactions with a small one).
-fn swa_slack() -> usize {
-    std::env::var("INKLING_SWA_SLACK")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(SWA_SLACK)
+/// INKLING_SWA_FULL=1 gives sliding-window slots max_ctx rows, so they never compact (the
+/// reference in tests/pipelined.rs).
+fn swa_full() -> bool {
+    std::env::var_os("INKLING_SWA_FULL").is_some()
 }
 /// Hidden-dimension slices of the short-batch depth mix (kernels/layer.metal MIX_SLICES, MIX_PART).
 const MIX_SLICES: usize = 9;
@@ -416,8 +409,6 @@ pub struct MetalModel {
     /// full-attention slots hold max_ctx rows from position 0). Advanced inside `encode`.
     swa_base: std::cell::Cell<usize>,
     swa_rows: usize,
-    /// Rows kept by a compaction: the window plus the slack.
-    swa_keep: usize,
     /// Per cache slot: does it belong to a sliding-window layer.
     swa_slot: Vec<bool>,
     trace_buf: Buffer,
@@ -481,6 +472,9 @@ fn opt(g: &Gguf, name: &str, want: DType) -> Result<Option<T>> {
 pub struct SeqState {
     pub pos: usize,
     conv: Vec<f32>,
+    /// K then V rows [pos - w, pos) of every sliding-window slot, w = min(pos, n_swa): a later
+    /// compaction may drop them from the live buffers.
+    swa: Vec<u8>,
 }
 
 /// Construction options.
@@ -642,9 +636,12 @@ impl MetalModel {
                 swa_slot[hp.slot(il, pass)] = hp.is_swa[il];
             }
         }
-        // compaction copies rows [keep, 2 keep) or later onto [0, keep): never overlapping
-        let swa_keep = hp.n_swa + swa_slack();
-        let swa_rows = max_ctx.min(2 * swa_keep + MAX_BATCH);
+        // compaction copies rows [n_swa, 2 n_swa) or later onto [0, n_swa): never overlapping
+        let swa_rows = if swa_full() {
+            max_ctx
+        } else {
+            max_ctx.min(2 * hp.n_swa + MAX_BATCH)
+        };
         let mut slots = Vec::with_capacity(hp.n_slots());
         for &swa in &swa_slot {
             let rows = if swa { swa_rows } else { max_ctx };
@@ -728,7 +725,6 @@ impl MetalModel {
             max_batch: MAX_BATCH,
             swa_base: std::cell::Cell::new(0),
             swa_rows,
-            swa_keep,
             swa_slot,
             gate16,
             exact_prefill: std::env::var_os("INKLING_EXACT_PREFILL").is_some(),
@@ -774,8 +770,9 @@ impl MetalModel {
         self.max_ctx
     }
 
-    /// Snapshot of the sequence state at the current position: the conv histories. KV rows are not
-    /// copied, so a snapshot stays valid only while no row below its `pos` is rewritten.
+    /// Snapshot of the sequence state at the current position: the conv histories and the
+    /// sliding-window rows (~160 MiB with an f16 cache once pos >= n_swa). Full-attention rows are
+    /// not copied, so a snapshot stays valid only while no row below its `pos` is rewritten.
     pub fn save_state(&self) -> SeqState {
         let mut conv = Vec::new();
         for s in &self.slots {
@@ -783,26 +780,24 @@ impl MetalModel {
                 conv.extend_from_slice(c.as_slice::<f32>());
             }
         }
+        let row = self.hp.kv_dim() * self.kv_bytes();
+        let w = self.pos.min(self.hp.n_swa);
+        let from = (self.pos - w - self.swa_base.get()) * row;
+        let mut swa = Vec::new();
+        for (s, _) in self.slots.iter().zip(&self.swa_slot).filter(|x| *x.1) {
+            for b in [&s.k, &s.v] {
+                swa.extend_from_slice(&b.as_slice::<u8>()[from..from + w * row]);
+            }
+        }
         SeqState {
             pos: self.pos,
             conv,
+            swa,
         }
-    }
-
-    /// Whether `load_state(st)` would see every K/V row it needs: the sliding-window rows before
-    /// st.pos may have been dropped by a compaction since.
-    pub fn can_restore(&self, st: &SeqState) -> bool {
-        let base = self.swa_base.get();
-        base == 0 || st.pos >= base + self.hp.n_swa
     }
 
     /// Returns to a snapshot from `save_state`, dropping everything after its position.
     pub fn load_state(&mut self, st: &SeqState) {
-        assert!(
-            self.can_restore(st),
-            "snapshot at {} predates the sliding-window rows",
-            st.pos
-        );
         self.pos = st.pos;
         self.dr_set_len(0);
         let mut off = 0;
@@ -813,6 +808,16 @@ impl MetalModel {
                 off += dst.len();
             }
         }
+        let w = st.pos.min(self.hp.n_swa);
+        let n = w * self.hp.kv_dim() * self.kv_bytes();
+        let mut off = 0;
+        for (s, _) in self.slots.iter().zip(&self.swa_slot).filter(|x| *x.1) {
+            for b in [&s.k, &s.v] {
+                b.as_mut_slice::<u8>()[..n].copy_from_slice(&st.swa[off..off + n]);
+                off += n;
+            }
+        }
+        self.swa_base.set(st.pos - w);
     }
 
     /// Starts a new sequence. KV rows past `pos` are never read, so only the conv histories need
@@ -2534,7 +2539,7 @@ impl MetalModel {
 
         let base = self.swa_base.get();
         if self.pos + nt - base > self.swa_rows {
-            let keep = self.swa_keep;
+            let keep = hp.n_swa;
             let new_base = self.pos - keep;
             let row = hp.kv_dim() * self.kv_bytes() / 4;
             e.parallel(|e| {

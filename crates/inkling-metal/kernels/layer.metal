@@ -755,12 +755,14 @@ struct ArgmaxArgs {
     uint seed;
 };
 
-// Uniform in (0, 1) from a hash of (seed, i): PCG output function.
+// Uniform in (0, 1) from a hash of (seed, i): PCG output function. 23 bits: (k + 0.5) / 2^23 is
+// exact in f32, while with 24 bits the largest k + 0.5 rounds up to 2^24, u becomes 1.0 and its
+// Gumbel noise +inf, which picked a random token in ~1.5% of decode steps.
 inline float hash_uniform(uint seed, uint i) {
     uint x = seed * 747796405u + i * 2891336453u + 1u;
     x = ((x >> ((x >> 28u) + 4u)) ^ x) * 277803737u;
     x = (x >> 22u) ^ x;
-    return (float(x >> 8) + 0.5f) * (1.0f / 16777216.0f);
+    return (float(x >> 9) + 0.5f) * (1.0f / 8388608.0f);
 }
 
 // Greedy pick on the GPU: tokens[0] <- argmax(logits) (lowest index on ties), also stored at

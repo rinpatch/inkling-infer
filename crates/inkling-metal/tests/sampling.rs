@@ -85,3 +85,42 @@ fn gumbel_max_matches_softmax() {
     .unwrap();
     assert_eq!(out.as_slice::<u32>()[0], 5);
 }
+
+/// At full vocabulary size, the noise must never be infinite: one token holds all the probability
+/// (every other logit is 60 lower, softmax weight ~e^-60 each), so any other pick means some
+/// entry's Gumbel noise overflowed.
+#[test]
+fn gumbel_noise_stays_finite_over_the_vocabulary() {
+    let ctx = Context::new().unwrap();
+    let n = 200_058usize;
+    let mut logits = vec![-30.0f32; n];
+    logits[3] = 30.0;
+    let draws = 3000usize;
+    let lb = ctx.buffer_from(&logits).unwrap();
+    let tokens = ctx.buffer(4).unwrap();
+    let out = ctx.buffer(draws * 4).unwrap();
+    ctx.run(|e| {
+        for i in 0..draws {
+            e.dispatch(
+                "argmax_token",
+                &[
+                    buf(&lb),
+                    buf(&tokens),
+                    buf(&out),
+                    bytes(&ArgmaxArgs {
+                        n: n as u32,
+                        out_index: i as u32,
+                        inv_temp: 1.0,
+                        seed: (i as u32).wrapping_mul(2654435761).wrapping_add(12345),
+                    }),
+                ],
+                (1, 1, 1),
+                (1024, 1, 1),
+            )?;
+        }
+        Ok(())
+    })
+    .unwrap();
+    let wrong = out.as_slice::<u32>().iter().filter(|&&t| t != 3).count();
+    assert_eq!(wrong, 0, "{wrong} of {draws} draws picked a token with probability ~e^-60");
+}

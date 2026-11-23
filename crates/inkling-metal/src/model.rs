@@ -60,6 +60,13 @@ struct MixArgs {
 }
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct MixNormArgs {
+    w: [u64; 4],
+    eps: f32,
+    on: u32,
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct MixConvArgs {
     nc: u32,
     scale: f32,
@@ -254,9 +261,9 @@ const MOE_NR: usize = 2;
 pub const MAX_VERIFY: usize = 8;
 /// Visible keys up to which decode attention runs in one pass (kernels/layer.metal ATTN_SHORT).
 const ATTN_SHORT: usize = 256;
-/// Hidden-dimension slices of the short-batch depth mix (kernels/layer.metal MIX_SLICES, MIX_NV).
+/// Hidden-dimension slices of the short-batch depth mix (kernels/layer.metal MIX_SLICES, MIX_PART).
 const MIX_SLICES: usize = 9;
-const MIX_NV: usize = 8 * 5;
+const MIX_PART: usize = 8 * 5 + 8 * 7 / 2;
 /// Visible keys from which decode attention uses the one-thread-per-key kernel.
 const ATTN_TPK_MIN: usize = 512;
 const MAX_BLOCKS: usize = 8;
@@ -355,7 +362,7 @@ struct Act {
     tmp: Buffer,
     logits: Buffer,
     tokens: Buffer,
-    /// depth_mix_part partial sums, [token][slice][MIX_NV]
+    /// depth_mix_part partial sums, [token][slice][MIX_PART]
     mix_part: Buffer,
     grp_count: Buffer,
     grp_offset: Buffer,
@@ -644,7 +651,7 @@ impl MetalModel {
             tmp: nb(ub * d)?,
             logits: nb(hp.n_vocab)?,
             tokens: nb(ub)?,
-            mix_part: nb(MAX_VERIFY * MIX_SLICES * MIX_NV)?,
+            mix_part: nb(MAX_VERIFY * MIX_SLICES * MIX_PART)?,
             grp_count: nb(hp.n_expert)?,
             grp_offset: nb(hp.n_expert)?,
             grp_pairs: nb(ub * hp.n_expert_used)?,
@@ -1244,6 +1251,10 @@ impl MetalModel {
 
     /// Depth attention for every token: blocks/out are `[plane][nt][d]`, cur is `[nt][d]`.
     #[allow(clippy::too_many_arguments)]
+    /// Depth mix of `n_q` queries into `out` planes. With `norm` (per-output weights and the
+    /// output buffer) and a short batch, the split kernels also write the RMS-normed outputs and
+    /// this returns true; otherwise the caller still has to norm.
+    #[allow(clippy::too_many_arguments)]
     fn mix(
         &self,
         e: &mut Encoder,
@@ -1254,7 +1265,8 @@ impl MetalModel {
         n_q: usize,
         out: &Buffer,
         nt: usize,
-    ) -> Result<()> {
+        norm: Option<(&[T], &Buffer)>,
+    ) -> Result<bool> {
         let d = self.hp.n_embd;
         let plane = (self.max_batch * d) as u32;
         let args = MixArgs {
@@ -1266,7 +1278,11 @@ impl MetalModel {
         if nt <= MAX_VERIFY {
             // decode / short batches: slices of d across threadgroups instead of one per token
             e.dispatch(
-                "depth_mix_part",
+                if norm.is_some() {
+                    "depth_mix_part_gram"
+                } else {
+                    "depth_mix_part"
+                },
                 &[
                     buf(blocks),
                     buf(cur),
@@ -1277,7 +1293,8 @@ impl MetalModel {
                 (MIX_SLICES, nt, 1),
                 (256, 1, 1),
             )?;
-            return self.mix_apply(e, blocks, n_blocks, cur, n_q, out, nt);
+            self.mix_apply(e, blocks, n_blocks, cur, n_q, out, nt, norm)?;
+            return Ok(norm.is_some());
         }
         e.dispatch(
             "depth_mix",
@@ -1286,19 +1303,16 @@ impl MetalModel {
                 buf(cur),
                 buf_at(&self.w, q.0),
                 buf(out),
-                bytes(&MixArgs {
-                    d: d as u32,
-                    n_blocks: n_blocks as u32,
-                    n_q: n_q as u32,
-                    plane,
-                }),
+                bytes(&args),
             ],
             (nt, 1, 1),
             (1024, 1, 1),
-        )
+        )?;
+        Ok(false)
     }
 
-    /// Second half of the split depth mix: reduces a.mix_part and writes `out`.
+    /// Second half of the split depth mix: reduces a.mix_part and writes `out` (and the normed
+    /// outputs, if the part kernel was the _gram one).
     #[allow(clippy::too_many_arguments)]
     fn mix_apply(
         &self,
@@ -1309,8 +1323,20 @@ impl MetalModel {
         n_q: usize,
         out: &Buffer,
         nt: usize,
+        norm: Option<(&[T], &Buffer)>,
     ) -> Result<()> {
         let d = self.hp.n_embd;
+        let mut nm = MixNormArgs {
+            w: [0; 4],
+            eps: self.hp.rms_eps,
+            on: norm.is_some() as u32,
+        };
+        if let Some((ws, _)) = norm {
+            assert_eq!(ws.len(), n_q);
+            for (k, t) in ws.iter().enumerate() {
+                nm.w[k] = (t.0 / 4) as u64;
+            }
+        }
         e.dispatch(
             "depth_mix_apply",
             &[
@@ -1324,6 +1350,9 @@ impl MetalModel {
                     n_q: n_q as u32,
                     plane: (self.max_batch * d) as u32,
                 }),
+                buf(&self.w),
+                buf(norm.map_or(out, |n| n.1)),
+                bytes(&nm),
             ],
             (MIX_SLICES, nt, 1),
             (256, 1, 1),
@@ -1795,6 +1824,16 @@ impl MetalModel {
         // q, k and v from one input, so only plane 0 is built and normalized.
         let shared_input = lw.is_swa && !msgs;
         let n_planes = if shared_input { 1 } else { 3 };
+        let norm_w: Vec<T> = (0..n_planes)
+            .map(|j| match (lw.attn_norm, lw.qkv_inp_norm) {
+                (Some(t), _) => t,
+                (None, Some(ts)) => ts[j],
+                _ => unreachable!("checked at load"),
+            })
+            .collect();
+        // the message gates change the mix output, so with them the norm stays a separate pass
+        let fold = (!msgs).then_some((&norm_w[..], &a.n_qkv));
+        let mut normed = false;
         match lw.attn_res_query {
             None => e.parallel(|e| {
                 for j in 0..n_planes {
@@ -1804,7 +1843,8 @@ impl MetalModel {
             })?,
             Some(q) => {
                 if lw.is_swa {
-                    self.mix(e, &a.blocks, *n_blocks, &a.h, q, 1, &a.inp, nt)?;
+                    let fold = fold.filter(|_| n_planes == 1);
+                    normed = self.mix(e, &a.blocks, *n_blocks, &a.h, q, 1, &a.inp, nt, fold)?;
                     e.parallel(|e| {
                         for j in 1..n_planes {
                             self.copy(e, &a.inp, 0, &a.inp, j * plane, nt * d)?;
@@ -1812,7 +1852,7 @@ impl MetalModel {
                         Ok(())
                     })?;
                 } else {
-                    self.mix(e, &a.blocks, *n_blocks, &a.h, q, 3, &a.inp, nt)?;
+                    normed = self.mix(e, &a.blocks, *n_blocks, &a.h, q, 3, &a.inp, nt, fold)?;
                 }
             }
         }
@@ -1876,12 +1916,7 @@ impl MetalModel {
             }
         }
         e.parallel(|e| {
-            for j in 0..n_planes {
-                let w = match (lw.attn_norm, lw.qkv_inp_norm) {
-                    (Some(t), _) => t,
-                    (None, Some(ts)) => ts[j],
-                    _ => unreachable!("checked at load"),
-                };
+            for (j, &w) in norm_w.iter().enumerate().filter(|_| !normed) {
                 self.norm(
                     e,
                     &a.inp,
@@ -2225,11 +2260,18 @@ impl MetalModel {
             assert!(blk < MAX_BLOCKS, "block list overflow");
             *n_blocks += 1;
         }
+        let ffn_norm = [lw.ffn_norm];
+        let fold = (!msgs).then_some((&ffn_norm[..], &a.n));
+        let normed;
         if nt == 1 && self.snap_off(sid, 2).is_none() {
             // decode: the conv, the push and the mix sums in one dispatch
             let nc = hp.n_conv;
             e.dispatch(
-                "depth_mix_part_conv",
+                if fold.is_some() {
+                    "depth_mix_part_conv_gram"
+                } else {
+                    "depth_mix_part_conv"
+                },
                 &[
                     buf(&a.blocks),
                     buf(&a.cur),
@@ -2255,7 +2297,8 @@ impl MetalModel {
                 (MIX_SLICES, 1, 1),
                 (256, 1, 1),
             )?;
-            self.mix_apply(e, &a.blocks, *n_blocks, &a.cur, 1, &a.m, nt)?;
+            self.mix_apply(e, &a.blocks, *n_blocks, &a.cur, 1, &a.m, nt, fold)?;
+            normed = fold.is_some();
             rec(e, "attn_out", s, &a.attn, 0, d)?;
             rec(e, "ffn_inp", s, &a.cur, 0, d)?;
         } else {
@@ -2281,7 +2324,7 @@ impl MetalModel {
             self.conv_hist(e, &a.wo_out, &slot.conv[2], d, nt)?;
             rec(e, "attn_out", s, &a.attn, 0, d)?;
             rec(e, "ffn_inp", s, &a.cur, 0, d)?;
-            self.mix(
+            normed = self.mix(
                 e,
                 &a.blocks,
                 *n_blocks,
@@ -2290,13 +2333,16 @@ impl MetalModel {
                 1,
                 &a.m,
                 nt,
+                fold,
             )?;
         }
         if msgs {
             let g = &self.loops[il - hp.loop_start].gates[3];
             self.msg_gate(e, g, &a.m, 0, &a.msgs, 3 * plane, &a.m, 0, nt)?;
         }
-        self.norm(e, &a.m, 0, Some(lw.ffn_norm), &a.n, 0, d, hp.rms_eps, nt)?;
+        if !normed {
+            self.norm(e, &a.m, 0, Some(lw.ffn_norm), &a.n, 0, d, hp.rms_eps, nt)?;
+        }
         if nt > MAX_VERIFY {
             // prefill: the router as an MMA GEMM; one threadgroup per (expert, token) re-read each
             // weight row per token (~32 ms of a 512-token batch for 0.3 GFLOP)
@@ -2432,6 +2478,7 @@ impl MetalModel {
                         4,
                         &a.msgs,
                         nt,
+                        None,
                     )?;
                     self.layer(e, il, hp.slot(il, pass), &mut n_blocks, true, nt, rec)?;
                 }
@@ -2447,7 +2494,7 @@ impl MetalModel {
 
         if let Some(out) = all_logits {
             // every position's logits ([nt][n_vocab], for quality measurement)
-            self.mix(
+            let normed = self.mix(
                 e,
                 &a.blocks,
                 n_blocks,
@@ -2456,18 +2503,21 @@ impl MetalModel {
                 1,
                 &a.m,
                 nt,
+                Some((&[self.output_norm], &a.n)),
             )?;
-            self.norm(
-                e,
-                &a.m,
-                0,
-                Some(self.output_norm),
-                &a.n,
-                0,
-                d,
-                hp.rms_eps,
-                nt,
-            )?;
+            if !normed {
+                self.norm(
+                    e,
+                    &a.m,
+                    0,
+                    Some(self.output_norm),
+                    &a.n,
+                    0,
+                    d,
+                    hp.rms_eps,
+                    nt,
+                )?;
+            }
             if let Some(c) = &self.capture {
                 self.copy(e, &a.n, 0, c, 3 * plane, nt * d)?;
             }
@@ -2502,7 +2552,7 @@ impl MetalModel {
         if nt > 1
             && let Some(c) = &self.capture
         {
-            self.mix(
+            let normed = self.mix(
                 e,
                 &a.blocks,
                 n_blocks,
@@ -2511,7 +2561,48 @@ impl MetalModel {
                 1,
                 &a.m,
                 nt,
+                Some((&[self.output_norm], &a.n)),
             )?;
+            if !normed {
+                self.norm(
+                    e,
+                    &a.m,
+                    0,
+                    Some(self.output_norm),
+                    &a.n,
+                    0,
+                    d,
+                    hp.rms_eps,
+                    nt,
+                )?;
+            }
+            self.copy(e, &a.n, 0, c, 3 * plane, nt * d)?;
+        }
+        // only the last token's logits are needed: run the output head on that row
+        let last = (nt - 1) * d;
+        let (blocks, h) = if nt == 1 {
+            (&a.blocks, &a.h)
+        } else {
+            e.parallel(|e| {
+                for b in 0..n_blocks {
+                    self.copy(e, &a.blocks, b * plane + last, &a.bank, b * plane, d)?;
+                }
+                self.copy(e, &a.h, last, &a.tmp, 0, d)
+            })?;
+            (&a.bank, &a.tmp)
+        };
+        let normed = self.mix(
+            e,
+            blocks,
+            n_blocks,
+            h,
+            self.output_res_query,
+            1,
+            &a.m,
+            1,
+            Some((&[self.output_norm], &a.n)),
+        )?;
+        if !normed {
             self.norm(
                 e,
                 &a.m,
@@ -2521,37 +2612,9 @@ impl MetalModel {
                 0,
                 d,
                 hp.rms_eps,
-                nt,
+                1,
             )?;
-            self.copy(e, &a.n, 0, c, 3 * plane, nt * d)?;
         }
-        // only the last token's logits are needed: run the output head on that row
-        let last = (nt - 1) * d;
-        for b in 0..n_blocks {
-            self.copy(e, &a.blocks, b * plane + last, &a.bank, b * plane, d)?;
-        }
-        self.copy(e, &a.h, last, &a.tmp, 0, d)?;
-        self.mix(
-            e,
-            &a.bank,
-            n_blocks,
-            &a.tmp,
-            self.output_res_query,
-            1,
-            &a.m,
-            1,
-        )?;
-        self.norm(
-            e,
-            &a.m,
-            0,
-            Some(self.output_norm),
-            &a.n,
-            0,
-            d,
-            hp.rms_eps,
-            1,
-        )?;
         if let Some(c) = &self.capture {
             self.copy(e, &a.n, 0, c, 3 * plane + last, d)?;
         }

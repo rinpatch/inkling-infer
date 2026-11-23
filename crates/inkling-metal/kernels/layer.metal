@@ -860,43 +860,68 @@ kernel void conv_hist_update(device const float *x [[buffer(0)]], device float *
 // the partials (a few dozen floats), takes the softmax over states and writes its slice of out.
 #define MIX_SLICES 9
 #define MIX_NV (MIX_MAX_STATES * (MIX_MAX_Q + 1))
+// Gram terms S_s . S_s' (s < s') follow the nv sums when the mix output gets RMS-normed: its squared
+// norm is sum_ss' w_s w_s' S_s.S_s', so the norm that follows the mix needs no pass of its own.
+#define MIX_NG (MIX_MAX_STATES * (MIX_MAX_STATES - 1) / 2)
+#define MIX_PART (MIX_NV + MIX_NG)
 
-// Grid: (MIX_SLICES, n_tokens), 256 threads. part: [token][slice][MIX_NV].
-kernel void depth_mix_part(device const float *blocks [[buffer(0)]], device const float *cur [[buffer(1)]],
-                           device const float *queries [[buffer(2)]], device float *part [[buffer(3)]], constant MixArgs &a [[buffer(4)]],
-                           uint2 g [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
-    threadgroup float red[8][MIX_NV];
-    uint t = g.y, sl = g.x;
-    blocks += (ulong)t * a.d;
-    cur += (ulong)t * a.d;
-    uint ns = a.n_blocks + 1, nv = ns * (a.n_q + 1);
-    uint chunk = (a.d + MIX_SLICES - 1) / MIX_SLICES;
-    uint lo = sl * chunk, hi = min(lo + chunk, a.d);
-#define state(s) ((s) < a.n_blocks ? blocks + (ulong)(s) * a.plane : cur)
-    float acc[MIX_NV];
-    for (uint v = 0; v < nv; ++v) acc[v] = 0.0f;
-    for (uint i = lo + tid; i < hi; i += 256) {
-        float qv[MIX_MAX_Q];
-        for (uint q = 0; q < a.n_q; ++q) qv[q] = queries[q * a.d + i];
-        for (uint s = 0; s < ns; ++s) {
-            float x = state(s)[i];
-            acc[s] += x * x;
-            for (uint q = 0; q < a.n_q; ++q) acc[ns + q * ns + s] += x * qv[q];
-        }
+template <bool GRAM>
+inline void mix_acc(thread float *acc, thread const float *v, thread const float *qv, uint ns, uint nq) {
+    for (uint s = 0; s < ns; ++s) {
+        acc[s] += v[s] * v[s];
+        for (uint q = 0; q < nq; ++q) acc[ns + q * ns + s] += v[s] * qv[q];
     }
-#undef state
+    if (GRAM) {
+        uint k = ns * (nq + 1);
+        for (uint s = 0; s < ns; ++s)
+            for (uint s2 = s + 1; s2 < ns; ++s2) acc[k++] += v[s] * v[s2];
+    }
+}
+
+// Reduces each thread's acc[0..n) over the threadgroup into part[0..n).
+inline void mix_reduce(thread float *acc, uint n, threadgroup float (*red)[MIX_PART], device float *part, uint tid) {
     uint sg = tid / 32, lane = tid % 32;
-    for (uint v = 0; v < nv; ++v) {
+    for (uint v = 0; v < n; ++v) {
         float r = simd_sum(acc[v]);
         if (lane == 0) red[sg][v] = r;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid < nv) {
+    if (tid < n) {
         float r = 0.0f;
         for (uint k = 0; k < 8; ++k) r += red[k][tid];
-        part[((ulong)t * MIX_SLICES + sl) * MIX_NV + tid] = r;
+        part[tid] = r;
     }
 }
+
+inline uint mix_nsums(uint ns, uint nq, bool gram) { return ns * (nq + 1) + (gram ? ns * (ns - 1) / 2 : 0); }
+
+// Grid: (MIX_SLICES, n_tokens), 256 threads. part: [token][slice][MIX_PART].
+template <bool GRAM>
+kernel void depth_mix_part(device const float *blocks [[buffer(0)]], device const float *cur [[buffer(1)]],
+                           device const float *queries [[buffer(2)]], device float *part [[buffer(3)]], constant MixArgs &a [[buffer(4)]],
+                           uint2 g [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float red[8][MIX_PART];
+    uint t = g.y, sl = g.x;
+    blocks += (ulong)t * a.d;
+    cur += (ulong)t * a.d;
+    uint ns = a.n_blocks + 1, n = mix_nsums(ns, a.n_q, GRAM);
+    uint chunk = (a.d + MIX_SLICES - 1) / MIX_SLICES;
+    uint lo = sl * chunk, hi = min(lo + chunk, a.d);
+    float acc[GRAM ? MIX_PART : MIX_NV];
+    for (uint v = 0; v < n; ++v) acc[v] = 0.0f;
+    for (uint i = lo + tid; i < hi; i += 256) {
+        float qv[MIX_MAX_Q], v[MIX_MAX_STATES];
+        for (uint q = 0; q < a.n_q; ++q) qv[q] = queries[q * a.d + i];
+        for (uint s = 0; s < ns; ++s) v[s] = s < a.n_blocks ? blocks[(ulong)s * a.plane + i] : cur[i];
+        mix_acc<GRAM>(acc, v, qv, ns, a.n_q);
+    }
+    mix_reduce(acc, n, red, part + ((ulong)t * MIX_SLICES + sl) * MIX_PART, tid);
+}
+
+template [[host_name("depth_mix_part")]] kernel void depth_mix_part<false>(device const float *, device const float *, device const float *,
+                                                                           device float *, constant MixArgs &, uint2, uint);
+template [[host_name("depth_mix_part_gram")]] kernel void depth_mix_part<true>(device const float *, device const float *, device const float *,
+                                                                               device float *, constant MixArgs &, uint2, uint);
 
 struct MixConvArgs {
     uint nc;
@@ -908,6 +933,7 @@ struct MixConvArgs {
 // and its residual bookkeeping, then depth_mix_part's sums. Each thread reads back only the
 // channels it wrote, so the conv needs no barrier of its own; this saves a dependent dispatch.
 // Grid: (MIX_SLICES, 1), 256 threads.
+template <bool GRAM>
 kernel void depth_mix_part_conv(device float *blocks [[buffer(0)]], device float *cur [[buffer(1)]],
                                 device const float *queries [[buffer(2)]], device float *part [[buffer(3)]],
                                 constant MixArgs &a [[buffer(4)]], device const float *x [[buffer(5)]],
@@ -915,14 +941,14 @@ kernel void depth_mix_part_conv(device float *blocks [[buffer(0)]], device float
                                 device float *y [[buffer(8)]], device const float *res [[buffer(9)]],
                                 constant MixConvArgs &c [[buffer(10)]],
                                 uint2 g [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
-    threadgroup float red[8][MIX_NV];
+    threadgroup float red[8][MIX_PART];
     uint sl = g.x;
-    uint ns = a.n_blocks + 1, nv = ns * (a.n_q + 1);
+    uint ns = a.n_blocks + 1, n = mix_nsums(ns, a.n_q, GRAM);
     uint chunk = (a.d + MIX_SLICES - 1) / MIX_SLICES;
     uint lo = sl * chunk, hi = min(lo + chunk, a.d);
     uint nh = c.nc - 1;
-    float acc[MIX_NV];
-    for (uint v = 0; v < nv; ++v) acc[v] = 0.0f;
+    float acc[GRAM ? MIX_PART : MIX_NV];
+    for (uint v = 0; v < n; ++v) acc[v] = 0.0f;
     for (uint i = lo + tid; i < hi; i += 256) {
         float xs[8];
         xs[0] = x[i];
@@ -936,42 +962,45 @@ kernel void depth_mix_part_conv(device float *blocks [[buffer(0)]], device float
         float cv = c.push ? out : r + out;
         cur[i] = cv;
         if (c.push) blocks[(ulong)(a.n_blocks - 1) * a.plane + i] = r;
-        float qv[MIX_MAX_Q];
+        float qv[MIX_MAX_Q], v[MIX_MAX_STATES];
         for (uint q = 0; q < a.n_q; ++q) qv[q] = queries[q * a.d + i];
-        for (uint s = 0; s < ns; ++s) {
-            float v = s < a.n_blocks ? blocks[(ulong)s * a.plane + i] : cv;
-            acc[s] += v * v;
-            for (uint q = 0; q < a.n_q; ++q) acc[ns + q * ns + s] += v * qv[q];
-        }
+        for (uint s = 0; s < ns; ++s) v[s] = s < a.n_blocks ? blocks[(ulong)s * a.plane + i] : cv;
+        mix_acc<GRAM>(acc, v, qv, ns, a.n_q);
     }
-    uint sg = tid / 32, lane = tid % 32;
-    for (uint v = 0; v < nv; ++v) {
-        float r = simd_sum(acc[v]);
-        if (lane == 0) red[sg][v] = r;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid < nv) {
-        float r = 0.0f;
-        for (uint k = 0; k < 8; ++k) r += red[k][tid];
-        part[(ulong)sl * MIX_NV + tid] = r;
-    }
+    mix_reduce(acc, n, red, part + (ulong)sl * MIX_PART, tid);
 }
 
-// Grid: (MIX_SLICES, n_tokens), 256 threads.
+#define MIX_PART_CONV_ARGS                                                                                                              \
+    device float *, device float *, device const float *, device float *, constant MixArgs &, device const float *, device float *, \
+        device const float *, device float *, device const float *, constant MixConvArgs &, uint2, uint
+template [[host_name("depth_mix_part_conv")]] kernel void depth_mix_part_conv<false>(MIX_PART_CONV_ARGS);
+template [[host_name("depth_mix_part_conv_gram")]] kernel void depth_mix_part_conv<true>(MIX_PART_CONV_ARGS);
+
+struct MixNormArgs {
+    ulong w[MIX_MAX_Q];  // float offsets of each output's norm weights in wbuf
+    float eps;
+    uint on;             // 0: no norm (part has no Gram terms)
+};
+
+// Grid: (MIX_SLICES, n_tokens), 256 threads. With norm on, also writes
+// nout[q][t] = rms_norm(out[q][t]) * w_q, using the Gram terms from depth_mix_part_gram.
 kernel void depth_mix_apply(device const float *blocks [[buffer(0)]], device const float *cur [[buffer(1)]],
                             device const float *part [[buffer(2)]], device float *out [[buffer(3)]], constant MixArgs &a [[buffer(4)]],
+                            device const float *wbuf [[buffer(5)]], device float *nout [[buffer(6)]], constant MixNormArgs &nm [[buffer(7)]],
                             uint2 g [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
-    threadgroup float tot[MIX_NV];
+    threadgroup float tot[MIX_PART];
     threadgroup float inv_rms[MIX_MAX_STATES];
     threadgroup float p[MIX_MAX_Q][MIX_MAX_STATES];
+    threadgroup float inv_out[MIX_MAX_Q];
     uint t = g.y, sl = g.x;
     blocks += (ulong)t * a.d;
     cur += (ulong)t * a.d;
     out += (ulong)t * a.d;
-    uint ns = a.n_blocks + 1, nv = ns * (a.n_q + 1);
-    if (tid < nv) {
+    nout += (ulong)t * a.d;
+    uint ns = a.n_blocks + 1, nv = ns * (a.n_q + 1), n = mix_nsums(ns, a.n_q, nm.on);
+    if (tid < n) {
         float r = 0.0f;
-        for (uint k = 0; k < MIX_SLICES; ++k) r += part[((ulong)t * MIX_SLICES + k) * MIX_NV + tid];
+        for (uint k = 0; k < MIX_SLICES; ++k) r += part[((ulong)t * MIX_SLICES + k) * MIX_PART + tid];
         tot[tid] = r;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -987,6 +1016,17 @@ kernel void depth_mix_apply(device const float *blocks [[buffer(0)]], device con
         float sum = 0.0f;
         for (uint s = 0; s < ns; ++s) { p[tid][s] = exp(p[tid][s] - m); sum += p[tid][s]; }
         for (uint s = 0; s < ns; ++s) p[tid][s] /= sum;
+        if (nm.on) {
+            // out = sum_s c_s S_s with c_s = p_s / rms_s
+            float ss = 0.0f;
+            uint k = nv;
+            for (uint s = 0; s < ns; ++s) {
+                float cs = p[tid][s] * inv_rms[s];
+                ss += cs * cs * tot[s];
+                for (uint s2 = s + 1; s2 < ns; ++s2) ss += 2.0f * cs * p[tid][s2] * inv_rms[s2] * tot[k++];
+            }
+            inv_out[tid] = rsqrt(max(ss, 0.0f) / a.d + nm.eps);
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     uint chunk = (a.d + MIX_SLICES - 1) / MIX_SLICES;
@@ -997,6 +1037,7 @@ kernel void depth_mix_apply(device const float *blocks [[buffer(0)]], device con
             float o = 0.0f;
             for (uint s = 0; s < ns; ++s) o += p[q][s] * inv_rms[s] * state(s)[i];
             out[(ulong)q * a.plane + i] = o;
+            if (nm.on) nout[(ulong)q * a.plane + i] = o * inv_out[q] * wbuf[nm.w[q] + i];
         }
 #undef state
 }

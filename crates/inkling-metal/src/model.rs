@@ -1576,7 +1576,7 @@ impl MetalModel {
                 bytes(ga),
             ],
             (ga.rank as usize, nt, 1),
-            (1024, 1, 1),
+            (256, 1, 1),
         )
     }
 

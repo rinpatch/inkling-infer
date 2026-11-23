@@ -238,30 +238,31 @@ struct GateArgs {
 // z[r] = D[r] . [rms(x); rms(m)]. One threadgroup per rank row; each recomputes the two norms
 // (2*d floats, served from cache) instead of a separate dispatch.
 // Grid: (rank, n_tokens), 1024 threads.
+// z[r] = D[r][:d] . rms(x) + D[r][d:] . rms(m). Grid: (rank, n_tokens), 256 threads.
+// The two norms and two dots reduce together as one float4 (one barrier pair, not four).
 template <typename WT>
 kernel void msg_gate_down(device const WT *D [[buffer(0)]], device const float *x [[buffer(1)]], device const float *m [[buffer(2)]],
                           device float *z [[buffer(3)]], constant GateArgs &a [[buffer(4)]], uint2 tg [[threadgroup_position_in_grid]],
                           uint tid [[thread_index_in_threadgroup]]) {
-    threadgroup float scratch[32];
-    const uint ntg = 1024;
+    threadgroup float4 scratch[8];
     uint r = tg.x;
-    x += (ulong)tg.y * a.d;
-    m += (ulong)tg.y * a.d;
-    z += (ulong)tg.y * a.rank;
-    float sx = 0.0f, sm = 0.0f, dx = 0.0f, dm = 0.0f;
-    device const WT *row = D + (ulong)r * 2 * a.d;
-    for (uint i = tid; i < a.d; i += ntg) {
-        float xv = x[i], mv = m[i];
-        sx += xv * xv;
-        sm += mv * mv;
-        dx += float(row[i]) * xv;
-        dm += float(row[a.d + i]) * mv;
+    device const float4 *x4 = (device const float4 *)(x + (ulong)tg.y * a.d);
+    device const float4 *m4 = (device const float4 *)(m + (ulong)tg.y * a.d);
+    device const vec<WT, 4> *dx4 = (device const vec<WT, 4> *)(D + (ulong)r * 2 * a.d);
+    device const vec<WT, 4> *dm4 = dx4 + a.d / 4;
+    float4 acc = 0.0f;  // |x|^2, |m|^2, D_x.x, D_m.m
+    for (uint i = tid; i < a.d / 4; i += 256) {
+        float4 xv = x4[i], mv = m4[i];
+        acc += float4(dot(xv, xv), dot(mv, mv), dot(float4(dx4[i]), xv), dot(float4(dm4[i]), mv));
     }
-    float ix = rsqrt(tg_sum(sx, scratch, tid, ntg) / a.d + 1e-6f);
-    float im = rsqrt(tg_sum(sm, scratch, tid, ntg) / a.d + 1e-6f);
-    float tx = tg_sum(dx, scratch, tid, ntg);
-    float tm = tg_sum(dm, scratch, tid, ntg);
-    if (tid == 0) z[r] = tx * ix + tm * im;
+    acc = simd_sum(acc);
+    if (tid % 32 == 0) scratch[tid / 32] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float4 t = 0.0f;
+        for (uint k = 0; k < 8; ++k) t += scratch[k];
+        z[(ulong)tg.y * a.rank + r] = t.z * rsqrt(t.x / a.d + 1e-6f) + t.w * rsqrt(t.y / a.d + 1e-6f);
+    }
 }
 
 // One simdgroup per channel c; out may alias x (each channel reads and writes only its own c).

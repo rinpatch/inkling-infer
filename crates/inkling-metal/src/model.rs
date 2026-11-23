@@ -245,6 +245,8 @@ pub const MAX_BATCH: usize = 512;
 const MOE_NR: usize = 2;
 /// Largest speculative verify batch (anchor + 7 drafts).
 pub const MAX_VERIFY: usize = 8;
+/// Visible keys up to which decode attention runs in one pass (kernels/layer.metal ATTN_SHORT).
+const ATTN_SHORT: usize = 256;
 /// Hidden-dimension slices of the short-batch depth mix (kernels/layer.metal MIX_SLICES, MIX_NV).
 const MIX_SLICES: usize = 9;
 const MIX_NV: usize = 8 * 5;
@@ -1943,67 +1945,103 @@ impl MetalModel {
                 0
             };
             let n_keys = self.pos + 1 - first;
+            let short = n_keys <= ATTN_SHORT && std::env::var_os("INKLING_NO_ATTN_SHORT").is_none();
             let split = n_keys
                 .div_ceil(64 / nkv)
                 .next_multiple_of(32)
                 .clamp(ATTN_SPLIT_MIN, ATTN_SPLIT);
             let n_split = n_keys.div_ceil(split);
-            // one thread per key once blocks hold many keys; lane-parallel dots for short ranges
-            let tpk = n_keys
-                >= std::env::var("INKLING_TPK_MIN")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or(ATTN_TPK_MIN);
-            e.dispatch(
-                match (tpk, self.kv_f16) {
-                    (true, true) => "attn_split_tpk_f16",
-                    (true, false) => "attn_split_tpk_f32",
-                    (false, true) => "attn_split_f16",
-                    (false, false) => "attn_split_f32",
-                },
-                &[
-                    buf(&a.q),
-                    buf(&slot.k),
-                    buf(&slot.v),
-                    buf(&a.r),
-                    buf_at(&self.w, lw.rel_bias.0),
-                    buf(&a.att_m),
-                    buf(&a.att_l),
-                    buf(&a.att_acc),
-                    bytes(&SplitArgs {
-                        head_dim: hd as u32,
-                        n_head: nh as u32,
-                        n_kv_head: nkv as u32,
-                        n_rel: nr as u32,
-                        pos: self.pos as u32,
-                        first: first as u32,
-                        extent: lw.rel_extent as u32,
-                        scale: 1.0 / (hd as f32).sqrt(),
-                        kv_dim: kvd as u32,
-                        n_split: n_split as u32,
-                        split: split as u32,
-                    }),
-                ],
-                (nkv, n_split, 1),
-                (hd, 1, 1),
-            )?;
-            e.dispatch(
-                "attn_combine",
-                &[
-                    buf(&a.att_m),
-                    buf(&a.att_l),
-                    buf(&a.att_acc),
-                    buf(&a.sinks),
-                    buf(&a.o),
-                    bytes(&CombineAttnArgs {
-                        head_dim: hd as u32,
-                        n_split: n_split as u32,
-                    }),
-                    buf(&a.gate),
-                ],
-                (nh, 1, 1),
-                (hd, 1, 1),
-            )?;
+            if short {
+                e.dispatch(
+                    if self.kv_f16 {
+                        "attn_short_f16"
+                    } else {
+                        "attn_short_f32"
+                    },
+                    &[
+                        buf(&a.q),
+                        buf(&slot.k),
+                        buf(&slot.v),
+                        buf(&a.r),
+                        buf_at(&self.w, lw.rel_bias.0),
+                        buf(&a.sinks),
+                        buf(&a.o),
+                        buf(&a.gate),
+                        bytes(&SplitArgs {
+                            head_dim: hd as u32,
+                            n_head: nh as u32,
+                            n_kv_head: nkv as u32,
+                            n_rel: nr as u32,
+                            pos: self.pos as u32,
+                            first: first as u32,
+                            extent: lw.rel_extent as u32,
+                            scale: 1.0 / (hd as f32).sqrt(),
+                            kv_dim: kvd as u32,
+                            n_split: 1,
+                            split: n_keys as u32,
+                        }),
+                    ],
+                    (nh, 1, 1),
+                    (hd, 1, 1),
+                )?;
+            } else {
+                // one thread per key once blocks hold many keys; lane-parallel dots for short ranges
+                let tpk = n_keys
+                    >= std::env::var("INKLING_TPK_MIN")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(ATTN_TPK_MIN);
+                e.dispatch(
+                    match (tpk, self.kv_f16) {
+                        (true, true) => "attn_split_tpk_f16",
+                        (true, false) => "attn_split_tpk_f32",
+                        (false, true) => "attn_split_f16",
+                        (false, false) => "attn_split_f32",
+                    },
+                    &[
+                        buf(&a.q),
+                        buf(&slot.k),
+                        buf(&slot.v),
+                        buf(&a.r),
+                        buf_at(&self.w, lw.rel_bias.0),
+                        buf(&a.att_m),
+                        buf(&a.att_l),
+                        buf(&a.att_acc),
+                        bytes(&SplitArgs {
+                            head_dim: hd as u32,
+                            n_head: nh as u32,
+                            n_kv_head: nkv as u32,
+                            n_rel: nr as u32,
+                            pos: self.pos as u32,
+                            first: first as u32,
+                            extent: lw.rel_extent as u32,
+                            scale: 1.0 / (hd as f32).sqrt(),
+                            kv_dim: kvd as u32,
+                            n_split: n_split as u32,
+                            split: split as u32,
+                        }),
+                    ],
+                    (nkv, n_split, 1),
+                    (hd, 1, 1),
+                )?;
+                e.dispatch(
+                    "attn_combine",
+                    &[
+                        buf(&a.att_m),
+                        buf(&a.att_l),
+                        buf(&a.att_acc),
+                        buf(&a.sinks),
+                        buf(&a.o),
+                        bytes(&CombineAttnArgs {
+                            head_dim: hd as u32,
+                            n_split: n_split as u32,
+                        }),
+                        buf(&a.gate),
+                    ],
+                    (nh, 1, 1),
+                    (hd, 1, 1),
+                )?;
+            }
             rec(e, "kqv_out", s, &a.o, 0, qd)?;
         } else {
             // prefill: relative-bias table per (token, head), then query-tiled attention

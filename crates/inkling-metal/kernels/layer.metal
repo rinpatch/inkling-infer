@@ -941,3 +941,68 @@ kernel void depth_mix_apply(device const float *blocks [[buffer(0)]], device con
         }
 #undef state
 }
+
+// ---- decode attention for short contexts ---------------------------------------------------------
+// Up to ATTN_SHORT keys: one threadgroup per query head does the whole softmax in one pass (logits
+// in threadgroup memory, sink in the denominator) and applies the output gate, where attn_split +
+// attn_combine cost two dispatches and ~12 barriers per chunk for blocks of 32 keys.
+// Grid: n_head threadgroups of head_dim (128) threads. Same buffers as attn_split, plus sinks,
+// out and gate as in attn_combine.
+#define ATTN_SHORT 256
+
+template <typename KV>
+kernel void attn_short(device const float *q [[buffer(0)]], device const KV *kc [[buffer(1)]], device const KV *vc [[buffer(2)]],
+                       device const float *r [[buffer(3)]], device const float *rel_bias [[buffer(4)]], device const float *sinks [[buffer(5)]],
+                       device float *out [[buffer(6)]], device float *gate [[buffer(7)]], constant SplitArgs &a [[buffer(8)]],
+                       uint h [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float qs[128];
+    threadgroup float rs[32];
+    threadgroup float sc[ATTN_SHORT];
+    threadgroup float scratch[32];
+    uint kvh = h / (a.n_head / a.n_kv_head);
+    qs[tid] = q[h * a.head_dim + tid];
+    if (tid < a.n_rel) rs[tid] = r[h * a.n_rel + tid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint n = a.pos + 1 - a.first;
+    // logits: thread t handles keys t and t + 128 (whole 128-dim dot and its bias row)
+    float lmax = -INFINITY;
+    for (uint t = tid; t < n; t += 128) {
+        uint j = a.first + t;
+        device const vec<KV, 4> *kr = (device const vec<KV, 4> *)(kc + (ulong)j * a.kv_dim + kvh * a.head_dim);
+        float d = 0.0f;
+        for (uint i = 0; i < 32; ++i) d += dot(((threadgroup const float4 *)qs)[i], float4(kr[i]));
+        uint dist = a.pos - j;
+        float b = 0.0f;
+        if (dist < a.extent) {
+            device const float *rb = rel_bias + (ulong)dist * a.n_rel;
+            for (uint i = 0; i < a.n_rel; ++i) b += rs[i] * rb[i];
+        }
+        float s = d * a.scale + b;
+        sc[t] = s;
+        lmax = max(lmax, s);
+    }
+    float sink = sinks[h];
+    float m = max(tg_max(lmax, scratch, tid, 128), sink);
+    float lsum = 0.0f;
+    for (uint t = tid; t < n; t += 128) {
+        float p = exp(sc[t] - m);
+        sc[t] = p;
+        lsum += p;
+    }
+    float total = tg_sum(lsum, scratch, tid, 128) + exp(sink - m);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    device const KV *vp = vc + (ulong)a.first * a.kv_dim + kvh * a.head_dim + tid;
+    float acc = 0.0f;
+    for (uint t = 0; t < n; ++t) acc += sc[t] * float(vp[(ulong)t * a.kv_dim]);
+    uint i = h * a.head_dim + tid;
+    float o = acc / total;
+    out[i] = o;
+    gate[i] = o * sigmoidf(gate[i]);
+}
+
+template [[host_name("attn_short_f32")]] kernel void attn_short<float>(device const float *, device const float *, device const float *,
+                                                                        device const float *, device const float *, device const float *,
+                                                                        device float *, device float *, constant SplitArgs &, uint, uint);
+template [[host_name("attn_short_f16")]] kernel void attn_short<half>(device const float *, device const half *, device const half *,
+                                                                       device const float *, device const float *, device const float *,
+                                                                       device float *, device float *, constant SplitArgs &, uint, uint);

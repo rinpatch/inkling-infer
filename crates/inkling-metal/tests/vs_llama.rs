@@ -92,7 +92,10 @@ fn check(name: &str, greedy_steps: usize) {
         &g,
         hp.clone(),
         tokens.len() + greedy_steps + 1,
-        Options { kv_f16: false },
+        Options {
+            kv_f16: false,
+            gate_f16: false,
+        },
     )
     .unwrap();
     m.exact_prefill = true;

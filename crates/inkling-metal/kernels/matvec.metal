@@ -238,7 +238,8 @@ struct GateArgs {
 // z[r] = D[r] . [rms(x); rms(m)]. One threadgroup per rank row; each recomputes the two norms
 // (2*d floats, served from cache) instead of a separate dispatch.
 // Grid: (rank, n_tokens), 1024 threads.
-kernel void msg_gate_down(device const float *D [[buffer(0)]], device const float *x [[buffer(1)]], device const float *m [[buffer(2)]],
+template <typename WT>
+kernel void msg_gate_down(device const WT *D [[buffer(0)]], device const float *x [[buffer(1)]], device const float *m [[buffer(2)]],
                           device float *z [[buffer(3)]], constant GateArgs &a [[buffer(4)]], uint2 tg [[threadgroup_position_in_grid]],
                           uint tid [[thread_index_in_threadgroup]]) {
     threadgroup float scratch[32];
@@ -248,13 +249,13 @@ kernel void msg_gate_down(device const float *D [[buffer(0)]], device const floa
     m += (ulong)tg.y * a.d;
     z += (ulong)tg.y * a.rank;
     float sx = 0.0f, sm = 0.0f, dx = 0.0f, dm = 0.0f;
-    device const float *row = D + (ulong)r * 2 * a.d;
+    device const WT *row = D + (ulong)r * 2 * a.d;
     for (uint i = tid; i < a.d; i += ntg) {
         float xv = x[i], mv = m[i];
         sx += xv * xv;
         sm += mv * mv;
-        dx += row[i] * xv;
-        dm += row[a.d + i] * mv;
+        dx += float(row[i]) * xv;
+        dm += float(row[a.d + i]) * mv;
     }
     float ix = rsqrt(tg_sum(sx, scratch, tid, ntg) / a.d + 1e-6f);
     float im = rsqrt(tg_sum(sm, scratch, tid, ntg) / a.d + 1e-6f);
@@ -265,7 +266,8 @@ kernel void msg_gate_down(device const float *D [[buffer(0)]], device const floa
 
 // One simdgroup per channel c; out may alias x (each channel reads and writes only its own c).
 // Grid: (ceil(d / MV_SG), n_tokens).
-kernel void msg_gate_up(device const float *F [[buffer(0)]], device const float *G [[buffer(1)]], device const float *z [[buffer(2)]],
+template <typename WT>
+kernel void msg_gate_up(device const WT *F [[buffer(0)]], device const WT *G [[buffer(1)]], device const float *z [[buffer(2)]],
                         device const float *x [[buffer(3)]], device const float *m [[buffer(4)]], device float *out [[buffer(5)]],
                         constant GateArgs &a [[buffer(6)]], uint2 tg [[threadgroup_position_in_grid]],
                         uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
@@ -275,17 +277,29 @@ kernel void msg_gate_up(device const float *F [[buffer(0)]], device const float 
     x += (ulong)tg.y * a.d;
     m += (ulong)tg.y * a.d;
     out += (ulong)tg.y * a.d;
-    device const float *fr = F + (ulong)c * a.rank;
-    device const float *gr = G + (ulong)c * a.rank;
+    device const WT *fr = F + (ulong)c * a.rank;
+    device const WT *gr = G + (ulong)c * a.rank;
     float f = 0.0f, g = 0.0f;
     for (uint j = lane; j < a.rank; j += 32) {
-        f += fr[j] * z[j];
-        g += gr[j] * z[j];
+        f += float(fr[j]) * z[j];
+        g += float(gr[j]) * z[j];
     }
     f = simd_sum(f);
     g = simd_sum(g);
     if (lane == 0) out[c] = (1.0f - precise::tanh(f)) * x[c] + precise::tanh(g) * m[c];
 }
+
+// f32: the GGUF weights as stored; f16: copies made at load (half the bytes per decode step)
+template [[host_name("msg_gate_down")]] kernel void msg_gate_down<float>(device const float *, device const float *, device const float *,
+                                                                         device float *, constant GateArgs &, uint2, uint);
+template [[host_name("msg_gate_down_f16")]] kernel void msg_gate_down<half>(device const half *, device const float *, device const float *,
+                                                                            device float *, constant GateArgs &, uint2, uint);
+template [[host_name("msg_gate_up")]] kernel void msg_gate_up<float>(device const float *, device const float *, device const float *,
+                                                                     device const float *, device const float *, device float *,
+                                                                     constant GateArgs &, uint2, uint, uint);
+template [[host_name("msg_gate_up_f16")]] kernel void msg_gate_up<half>(device const half *, device const half *, device const float *,
+                                                                        device const float *, device const float *, device float *,
+                                                                        constant GateArgs &, uint2, uint, uint);
 
 // ---- several Q8_0 matrices that share one input, in one dispatch -------------------------------
 // Small projections (sinks: 24 rows, conv taps: 32, rel: 384) can't fill the GPU on their own;

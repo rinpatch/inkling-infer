@@ -298,6 +298,8 @@ struct GateT {
     down: T,
     forget: T,
     gain: T,
+    /// byte offsets of f16 copies in MetalModel::gate16 (Options::gate_f16)
+    h: [usize; 3],
 }
 
 struct LoopT {
@@ -390,6 +392,8 @@ pub struct MetalModel {
     /// fixture, f16 tiles leave KL vs llama.cpp unchanged (mean 4.8e-3 vs 4.7e-3) and move us from
     /// our exact run by a mean 2.1e-3 (tests/quality.rs).
     pub exact_prefill: bool,
+    /// f16 copies of the loop gate matrices (Options::gate_f16), used by the decode gate kernels
+    gate16: Option<Buffer>,
     /// Stats of the most recent step.
     pub last: RunStats,
     /// DSpark drafter features, [4][max_batch][d]: the inputs of slots `drafter::FEATURE_SLOTS`
@@ -445,11 +449,17 @@ pub struct Options {
     /// decisions, so bit-faithful comparisons (tests/vs_cpu.rs) pin an f32 cache. Kcur/Vcur traces
     /// need an f32 cache.
     pub kv_f16: bool,
+    /// Decode reads f16 copies of the loop gate matrices (default; INKLING_GATE_F32=1 keeps f32).
+    /// Half the bytes of ~226 MB per token, +1.5% decode; next-token KL vs the f32-gate decode is
+    /// 1.1e-4 mean over 3810 positions, against 4.4e-3 between us and llama.cpp
+    /// (tests/quality.rs next_token_kl_decode_gate_precision). Exact comparisons pin f32.
+    pub gate_f16: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
         Options {
+            gate_f16: std::env::var_os("INKLING_GATE_F32").is_none(),
             kv_f16: std::env::var_os("INKLING_KV_F32").is_none(),
         }
     }
@@ -540,6 +550,7 @@ impl MetalModel {
                     down: tensor(g, &format!("blk.{i}.loop_{c}_ctrl_down.weight"), F32)?,
                     forget: tensor(g, &format!("blk.{i}.loop_{c}_ctrl_forget.weight"), F32)?,
                     gain: tensor(g, &format!("blk.{i}.loop_{c}_ctrl_gain.weight"), F32)?,
+                    h: [0; 3],
                 })
             };
             loops.push(LoopT {
@@ -548,6 +559,32 @@ impl MetalModel {
             });
         }
 
+        // f16 copies of the loop gate matrices for decode (Options::gate_f16)
+        let gate16 = if opts.gate_f16 {
+            let mut blob: Vec<u8> = Vec::new();
+            let mm = g.mmap();
+            for lp in loops.iter_mut() {
+                for gt in lp.gates.iter_mut() {
+                    for (k, (t, n)) in [
+                        (gt.down, 2 * hp.n_embd * hp.loop_gate_rank),
+                        (gt.forget, hp.n_embd * hp.loop_gate_rank),
+                        (gt.gain, hp.n_embd * hp.loop_gate_rank),
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        gt.h[k] = blob.len();
+                        for c in mm[t.0..t.0 + 4 * n].chunks_exact(4) {
+                            let v = f32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+                            blob.extend_from_slice(&half::f16::from_f32(v).to_le_bytes());
+                        }
+                    }
+                }
+            }
+            Some(ctx.buffer_from(&blob)?)
+        } else {
+            None
+        };
         let f = 4usize;
         let (d, kvd, qd) = (hp.n_embd, hp.kv_dim(), hp.q_dim());
         let hist = hp.n_conv - 1;
@@ -632,6 +669,7 @@ impl MetalModel {
             a,
             max_ctx,
             max_batch: MAX_BATCH,
+            gate16,
             exact_prefill: std::env::var_os("INKLING_EXACT_PREFILL").is_some(),
             capture: None,
             conv_snap: None,
@@ -1463,9 +1501,16 @@ impl MetalModel {
         nt: usize,
     ) -> Result<()> {
         e.dispatch(
-            "msg_gate_down",
+            if self.gate16.is_some() {
+                "msg_gate_down_f16"
+            } else {
+                "msg_gate_down"
+            },
             &[
-                buf_at(&self.w, g.down.0),
+                match &self.gate16 {
+                    Some(b) => buf_at(b, g.h[0]),
+                    None => buf_at(&self.w, g.down.0),
+                },
                 buf_at(x, x_off * 4),
                 buf_at(m, m_off * 4),
                 buf_at(&self.a.z, z_off * 4),
@@ -1493,10 +1538,20 @@ impl MetalModel {
         nt: usize,
     ) -> Result<()> {
         e.dispatch(
-            "msg_gate_up",
+            if self.gate16.is_some() {
+                "msg_gate_up_f16"
+            } else {
+                "msg_gate_up"
+            },
             &[
-                buf_at(&self.w, g.forget.0),
-                buf_at(&self.w, g.gain.0),
+                match &self.gate16 {
+                    Some(b) => buf_at(b, g.h[1]),
+                    None => buf_at(&self.w, g.forget.0),
+                },
+                match &self.gate16 {
+                    Some(b) => buf_at(b, g.h[2]),
+                    None => buf_at(&self.w, g.gain.0),
+                },
                 buf_at(&self.a.z, z_off * 4),
                 buf_at(x, x_off * 4),
                 buf_at(m, m_off * 4),

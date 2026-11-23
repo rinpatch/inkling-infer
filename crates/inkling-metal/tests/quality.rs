@@ -115,8 +115,16 @@ fn next_token_kl_over_all_positions() {
     let hp = Hparams::from_gguf(&g).unwrap();
 
     let run = |exact: bool, kv_f16: bool, reference: Option<&[Top]>| -> (Vec<Top>, f32, f32) {
-        let mut m =
-            MetalModel::with_options(&g, hp.clone(), tokens.len() + 1, Options { kv_f16 }).unwrap();
+        let mut m = MetalModel::with_options(
+            &g,
+            hp.clone(),
+            tokens.len() + 1,
+            Options {
+                kv_f16,
+                gate_f16: false,
+            },
+        )
+        .unwrap();
         m.exact_prefill = exact;
         let (mut kl_llama, mut kl_ref, mut top1_llama, mut top1_ref) =
             (Vec::new(), Vec::new(), 0usize, 0usize);
@@ -155,4 +163,62 @@ fn next_token_kl_over_all_positions() {
         "mean KL vs llama.cpp: exact {ml_exact:.2e}, f16 tiles {ml_tiles:.2e}, f16 KV {ml_kv:.2e}"
     );
     println!("mean KL vs our exact run: f16 tiles {mr_tiles:.2e}, f16 KV {mr_kv:.2e}");
+}
+
+/// The same metric through token-by-token decode (the path that uses the decode-only kernels, e.g.
+/// the f16 loop-gate copies of Options::gate_f16): f32 gates vs f16 gates, each against llama.cpp,
+/// and f16 against the f32 decode run.
+#[test]
+#[ignore = "~4 min: two token-by-token decodes of 3810 positions"]
+fn next_token_kl_decode_gate_precision() {
+    let Some(mp) = model_path() else {
+        eprintln!("SKIP: model not found");
+        return;
+    };
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/out/swa_topk");
+    let Ok(toks) = fs::read_to_string(dir.join("tokens.txt")) else {
+        eprintln!("SKIP: fixtures/out/swa_topk missing");
+        return;
+    };
+    let tokens: Vec<u32> = toks.lines().map(|l| l.trim().parse().unwrap()).collect();
+    let llama = read_topk(&dir.join("topk.bin"));
+    let g = gguf::Gguf::open(mp).unwrap();
+    let hp = Hparams::from_gguf(&g).unwrap();
+    let run = |f16: bool, reference: Option<&[Top]>| -> Vec<Top> {
+        let mut m = MetalModel::with_options(
+            &g,
+            hp.clone(),
+            tokens.len() + 1,
+            Options {
+                kv_f16: true,
+                gate_f16: f16,
+            },
+        )
+        .unwrap();
+        let (mut kl_l, mut kl_r, mut t1_l, mut t1_r) = (Vec::new(), Vec::new(), 0usize, 0usize);
+        let mut tops = Vec::new();
+        for (p, &t) in tokens.iter().enumerate() {
+            let lg = m.step(t, &mut inkling::NoTrace).unwrap();
+            let top = top_of(&lg);
+            kl_l.push(kl(&llama[p], &lg, top.lse));
+            t1_l += (top.ids[0] == llama[p].ids[0]) as usize;
+            if let Some(r) = reference {
+                kl_r.push(kl(&r[p], &lg, top.lse));
+                t1_r += (top.ids[0] == r[p].ids[0]) as usize;
+            }
+            tops.push(top);
+        }
+        let label = if f16 {
+            "decode, f16 gates"
+        } else {
+            "decode, f32 gates"
+        };
+        summary(&format!("{label}: vs llama.cpp"), &mut kl_l, t1_l);
+        if reference.is_some() {
+            summary(&format!("{label}: vs f32-gate decode"), &mut kl_r, t1_r);
+        }
+        tops
+    };
+    let f32_run = run(false, None);
+    run(true, Some(&f32_run));
 }

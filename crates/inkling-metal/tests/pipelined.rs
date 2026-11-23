@@ -94,9 +94,16 @@ fn verify_then_rewind_matches_the_kept_prefix() {
     let (head, batch) = prompt.split_at(prompt.len() - inkling_metal::model::MAX_VERIFY);
     let next = 4242u32;
     // f32 cache and tiles: with f16 storage, batch and decode can flip near-tied expert choices
-    let mut m =
-        MetalModel::with_options(&g, hp.clone(), prompt.len() + 4, Options { kv_f16: false })
-            .unwrap();
+    let mut m = MetalModel::with_options(
+        &g,
+        hp.clone(),
+        prompt.len() + 4,
+        Options {
+            kv_f16: false,
+            gate_f16: false,
+        },
+    )
+    .unwrap();
     m.exact_prefill = true;
     for keep in [1, 3, batch.len() - 1, batch.len()] {
         // reference: the kept prefix token by token, then `next`
@@ -163,7 +170,10 @@ fn speculative_matches_greedy() {
         &g,
         hp.clone(),
         prompt.len() + n + 16,
-        Options { kv_f16: false },
+        Options {
+            kv_f16: false,
+            gate_f16: false,
+        },
     )
     .unwrap();
     m.exact_prefill = true;

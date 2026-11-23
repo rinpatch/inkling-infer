@@ -147,3 +147,9 @@ Decode with every non-weight kernel skipped (INKLING_SKIP, timing bound only) ru
 - FFN RMS norm folded into the decode router and expert gate/up kernels: correct but slower (tg128 45.35 vs 46.5); every gate/up threadgroup recomputing the norm costs more than the dependent dispatch it removes. Reverted.
 - Router weights to f16 for decode: tg128 46.73 / 46.78 / 46.60 vs 46.40 / 46.79 / 46.44 (~+0.3%, within noise); not worth a lossy change on the routing path. Reverted.
 - 64-token tiles for the dense prefill GEMM (gemm4: one matrix, 4x4 accumulators per simdgroup): wrong results and slower (pp512 434.6 vs 443.4). Reverted. It fails exactly like the first 64-pair MoE attempt, and both pass a 4x4 simdgroup-matrix array by reference into mma_4xj<E, 64>; the two-halves 2x(4x2) version computed correctly. Treat 4x4 accumulator blocks per simdgroup as broken on this toolchain until proven otherwise.
+
+## Prefill vs the compute peak, 2026-11-23
+
+Measured matrix-unit peak (examples/kernel_bw.rs mma_peak: 8x8 simdgroup multiply-accumulates, registers only): 7.98 TFLOP/s f16, 7.80 f32 (no doubled f16 rate on this GPU).
+
+A prefill token costs ~8.8 GFLOP (experts 63.7M + dense 26.9M multiply-adds per layer pass, 48 passes; attention ~0.08G at these lengths). pp512 at 443 tok/s = 3.9 TFLOP/s, ~49% of peak. The GEMMs run at 56-68% (dense 5.5, expert gate/up 4.7, expert down 4.5 TFLOP/s) and take ~79% of the batch; the other ~21% is attention, the bias table, convs, depth mix, norms and the router. llama.cpp's best build (378 tok/s) is ~42% of peak. Decode, by contrast, is at 96% of the bandwidth limit in its weight kernels.

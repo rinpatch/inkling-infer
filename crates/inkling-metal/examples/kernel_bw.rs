@@ -460,6 +460,28 @@ fn main() -> anyhow::Result<()> {
         t_soa,
     );
 
+    // 5. matrix-unit peak: 8x8x8 multiply-accumulates per simdgroup, registers only
+    let out_peak = ctx.buffer(4 << 20)?;
+    let iters: u32 = 4096;
+    for kname in ["mma_peak_f16", "mma_peak_f32"] {
+        let groups = 20 * 64;
+        let t = best(&mut || {
+            Ok(ctx
+                .run(|e| {
+                    e.dispatch(
+                        kname,
+                        &[buf(&out_peak), bytes(&iters)],
+                        (groups, 1, 1),
+                        (256, 1, 1),
+                    )
+                })?
+                .gpu_s)
+        })?;
+        let simdgroups = groups * 256 / 32;
+        let flops = simdgroups as f64 * iters as f64 * 8.0 * 512.0 * 2.0;
+        println!("{kname:34} {:6.2} TFLOP/s", flops / t / 1e12);
+    }
+
     // 3. a real decode step for comparison
     let mut m = MetalModel::new(&g, hp.clone(), 256)?;
     for i in 0..64u32 {

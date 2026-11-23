@@ -413,3 +413,20 @@ MOE_TGEMM_INSTANCES(block_iq4_nl, float, "iq4_nl_f32", 32)
 MOE_TGEMM_INSTANCES(block_iq4_nl, float, "iq4_nl_f32", 16)
 MOE_TGEMM_INSTANCES(block_q8_0, float, "q8_0_f32", 32)
 MOE_TGEMM_INSTANCES(block_q8_0, float, "q8_0_f32", 16)
+
+// Peak probe for examples/kernel_bw.rs: back-to-back 8x8 simdgroup multiply-accumulates on
+// registers only (8 independent chains per simdgroup), no memory traffic.
+template <typename Mat>
+kernel void mma_peak(device float *out [[buffer(0)]], constant uint &iters [[buffer(1)]], uint tid [[thread_position_in_grid]],
+                     uint lane [[thread_index_in_simdgroup]]) {
+    Mat a = Mat(1.0001f), b = Mat(0.9999f);
+    simdgroup_float8x8 acc[8];
+    for (uint i = 0; i < 8; ++i) acc[i] = simdgroup_float8x8(0);
+    for (uint it = 0; it < iters; ++it)
+        for (uint i = 0; i < 8; ++i) simdgroup_multiply_accumulate(acc[i], a, b, acc[i]);
+    float s = 0.0f;
+    for (uint i = 0; i < 8; ++i) s += acc[i].thread_elements()[0];
+    if (s == 12345.0f) out[tid] = s;  // keeps the loop alive
+}
+template [[host_name("mma_peak_f16")]] kernel void mma_peak<simdgroup_half8x8>(device float *, constant uint &, uint, uint);
+template [[host_name("mma_peak_f32")]] kernel void mma_peak<simdgroup_float8x8>(device float *, constant uint &, uint, uint);

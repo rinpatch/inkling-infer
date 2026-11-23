@@ -325,8 +325,13 @@ kernel void attn_split(device const float *q [[buffer(0)]], device const KV *kc 
 
     uint lo = a.first + s * a.split;
     uint hi = min(lo + a.split, a.pos + 1);
-    float m[ATTN_MAX_GRP], l[ATTN_MAX_GRP], acc[ATTN_MAX_GRP];
+    float m[ATTN_MAX_GRP], l[ATTN_MAX_GRP];
+    // V: simdgroup sg takes every 4th key, each lane 4 dims, merged across simdgroups at the end
+    // (a thread per dim looping over every key was a long serial chain per chunk)
+    float4 acc[ATTN_MAX_GRP];
     for (uint g = 0; g < grp; ++g) { m[g] = -INFINITY; l[g] = 0.0f; acc[g] = 0.0f; }
+    uint vsg = tid / 32, vlane = tid % 32;
+    device const vec<KV, 4> *vb = (device const vec<KV, 4> *)(vc + kvh * a.head_dim) + vlane;
     threadgroup float lg_t[ATTN_MAX_GRP][ATTN_CHUNK];
     uint sg = tid / 32, lane = tid % 32, nsg = ntg / 32;
     for (uint j0 = lo; j0 < hi; j0 += ATTN_CHUNK) {
@@ -358,18 +363,24 @@ kernel void attn_split(device const float *q [[buffer(0)]], device const KV *kc 
             m[g] = m_new;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        device const KV *vp = vc + (ulong)j0 * a.kv_dim + kvh * a.head_dim + tid;
-        for (uint jj = 0; jj < n; ++jj) {
-            float v = float(vp[(ulong)jj * a.kv_dim]);
+        for (uint jj = vsg; jj < n; jj += 4) {
+            float4 v = float4(vb[(ulong)(j0 + jj) * (a.kv_dim / 4)]);
             for (uint g = 0; g < grp; ++g) acc[g] += pl_t[g][jj] * v;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+    threadgroup float4 vpart[4][ATTN_MAX_GRP][32];
+    for (uint g = 0; g < grp; ++g) vpart[vsg][g][vlane] = acc[g];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint g = 0; g < grp; ++g) {
         uint h = kvh * grp + g;
         uint idx = h * a.n_split + s;
         if (tid == 0) { pm[idx] = m[g]; pl[idx] = l[g]; }
-        pacc[(ulong)idx * a.head_dim + tid] = acc[g];
+        threadgroup const float *vp0 = (threadgroup const float *)vpart[0][g];
+        threadgroup const float *vp1 = (threadgroup const float *)vpart[1][g];
+        threadgroup const float *vp2 = (threadgroup const float *)vpart[2][g];
+        threadgroup const float *vp3 = (threadgroup const float *)vpart[3][g];
+        pacc[(ulong)idx * a.head_dim + tid] = vp0[tid] + vp1[tid] + vp2[tid] + vp3[tid];
     }
 }
 
@@ -397,8 +408,13 @@ kernel void attn_split_tpk(device const float *q [[buffer(0)]], device const KV 
 
     uint lo = a.first + s * a.split;
     uint hi = min(lo + a.split, a.pos + 1);
-    float m[ATTN_MAX_GRP], l[ATTN_MAX_GRP], acc[ATTN_MAX_GRP];
+    float m[ATTN_MAX_GRP], l[ATTN_MAX_GRP];
+    // V: simdgroup sg takes every 4th key, each lane 4 dims, merged across simdgroups at the end
+    // (a thread per dim looping over every key was a long serial chain per chunk)
+    float4 acc[ATTN_MAX_GRP];
     for (uint g = 0; g < grp; ++g) { m[g] = -INFINITY; l[g] = 0.0f; acc[g] = 0.0f; }
+    uint vsg = tid / 32, vlane = tid % 32;
+    device const vec<KV, 4> *vb = (device const vec<KV, 4> *)(vc + kvh * a.head_dim) + vlane;
     threadgroup float lg_t[ATTN_MAX_GRP][ATTN_CHUNK];
     for (uint j0 = lo; j0 < hi; j0 += ATTN_CHUNK) {
         uint n = min((uint)ATTN_CHUNK, hi - j0);
@@ -437,18 +453,24 @@ kernel void attn_split_tpk(device const float *q [[buffer(0)]], device const KV 
             m[g] = m_new;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        device const KV *vp = vc + (ulong)j0 * a.kv_dim + kvh * a.head_dim + tid;
-        for (uint jj = 0; jj < n; ++jj) {
-            float v = float(vp[(ulong)jj * a.kv_dim]);
+        for (uint jj = vsg; jj < n; jj += 4) {
+            float4 v = float4(vb[(ulong)(j0 + jj) * (a.kv_dim / 4)]);
             for (uint g = 0; g < grp; ++g) acc[g] += pl_t[g][jj] * v;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
+    threadgroup float4 vpart[4][ATTN_MAX_GRP][32];
+    for (uint g = 0; g < grp; ++g) vpart[vsg][g][vlane] = acc[g];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint g = 0; g < grp; ++g) {
         uint h = kvh * grp + g;
         uint idx = h * a.n_split + s;
         if (tid == 0) { pm[idx] = m[g]; pl[idx] = l[g]; }
-        pacc[(ulong)idx * a.head_dim + tid] = acc[g];
+        threadgroup const float *vp0 = (threadgroup const float *)vpart[0][g];
+        threadgroup const float *vp1 = (threadgroup const float *)vpart[1][g];
+        threadgroup const float *vp2 = (threadgroup const float *)vpart[2][g];
+        threadgroup const float *vp3 = (threadgroup const float *)vpart[3][g];
+        pacc[(ulong)idx * a.head_dim + tid] = vp0[tid] + vp1[tid] + vp2[tid] + vp3[tid];
     }
 }
 

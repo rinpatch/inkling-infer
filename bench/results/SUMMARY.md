@@ -158,3 +158,4 @@ A prefill token costs ~8.8 GFLOP (experts 63.7M + dense 26.9M multiply-adds per 
 - MoE gate and up as two one-matrix passes (half the accumulators and weight tiles per thread): pp512 435.5 vs 447.2, reverted. The second read of the input tile and the activation round trip cost more than the occupancy relief.
 
 MoE tile GEMM variants tried today, all against the current kernel (32/16-pair work-list tiles, 64 rows, 4 simdgroups with 4x2 accumulators per matrix, results from the accumulators): 64-pair tiles, 64-column steps, 8 simdgroups with 2x2, double-buffered pipelining, register prefetch, split gate/up. Every one lost or miscompiled. Packing two small experts into a 32-pair tile would need two weight tiles per threadgroup, the same work as two 16-pair tiles, so it was not tried.
+- rel_table with 8 rows per thread (bias row kept in registers): pp512 448.9 vs 455.2 in an A/B, reverted.

@@ -60,6 +60,13 @@ struct MixArgs {
 }
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct MixConvArgs {
+    nc: u32,
+    scale: f32,
+    push: u32,
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct ConvArgs {
     ch: u32,
     nc: u32,
@@ -1270,18 +1277,7 @@ impl MetalModel {
                 (MIX_SLICES, nt, 1),
                 (256, 1, 1),
             )?;
-            return e.dispatch(
-                "depth_mix_apply",
-                &[
-                    buf(blocks),
-                    buf(cur),
-                    buf(&self.a.mix_part),
-                    buf(out),
-                    bytes(&args),
-                ],
-                (MIX_SLICES, nt, 1),
-                (256, 1, 1),
-            );
+            return self.mix_apply(e, blocks, n_blocks, cur, n_q, out, nt);
         }
         e.dispatch(
             "depth_mix",
@@ -1299,6 +1295,38 @@ impl MetalModel {
             ],
             (nt, 1, 1),
             (1024, 1, 1),
+        )
+    }
+
+    /// Second half of the split depth mix: reduces a.mix_part and writes `out`.
+    #[allow(clippy::too_many_arguments)]
+    fn mix_apply(
+        &self,
+        e: &mut Encoder,
+        blocks: &Buffer,
+        n_blocks: usize,
+        cur: &Buffer,
+        n_q: usize,
+        out: &Buffer,
+        nt: usize,
+    ) -> Result<()> {
+        let d = self.hp.n_embd;
+        e.dispatch(
+            "depth_mix_apply",
+            &[
+                buf(blocks),
+                buf(cur),
+                buf(&self.a.mix_part),
+                buf(out),
+                bytes(&MixArgs {
+                    d: d as u32,
+                    n_blocks: n_blocks as u32,
+                    n_q: n_q as u32,
+                    plane: (self.max_batch * d) as u32,
+                }),
+            ],
+            (MIX_SLICES, nt, 1),
+            (256, 1, 1),
         )
     }
 
@@ -2192,45 +2220,78 @@ impl MetalModel {
         } else {
             Second::AddRes(&a.h, &a.cur)
         };
-        // on a boundary the conv does not read a.h, so the push can run alongside it
         let blk = *n_blocks;
-        e.parallel(|e| {
-            if boundary {
-                assert!(blk < MAX_BLOCKS, "block list overflow");
-                self.copy(e, &a.h, 0, &a.blocks, blk * plane, nt * d)?;
-            }
-            self.conv(
-                e,
-                &a.wo_out,
-                &slot.conv[2],
-                lw.attn_post_conv,
-                None,
-                &a.attn,
-                0,
-                second,
-                d,
-                nt,
-                self.snap_off(sid, 2),
-            )
-        })?;
-        self.conv_hist(e, &a.wo_out, &slot.conv[2], d, nt)?;
         if boundary {
+            assert!(blk < MAX_BLOCKS, "block list overflow");
             *n_blocks += 1;
         }
-        rec(e, "attn_out", s, &a.attn, 0, d)?;
-        rec(e, "ffn_inp", s, &a.cur, 0, d)?;
-
-        // MoE
-        self.mix(
-            e,
-            &a.blocks,
-            *n_blocks,
-            &a.cur,
-            lw.ffn_res_query,
-            1,
-            &a.m,
-            nt,
-        )?;
+        if nt == 1 && self.snap_off(sid, 2).is_none() {
+            // decode: the conv, the push and the mix sums in one dispatch
+            let nc = hp.n_conv;
+            e.dispatch(
+                "depth_mix_part_conv",
+                &[
+                    buf(&a.blocks),
+                    buf(&a.cur),
+                    buf_at(&self.w, lw.ffn_res_query.0),
+                    buf(&a.mix_part),
+                    bytes(&MixArgs {
+                        d: d as u32,
+                        n_blocks: *n_blocks as u32,
+                        n_q: 1,
+                        plane: plane as u32,
+                    }),
+                    buf(&a.wo_out),
+                    buf(&slot.conv[2]),
+                    buf_at(&self.w, lw.attn_post_conv.0),
+                    buf(&a.attn),
+                    buf(&a.h),
+                    bytes(&MixConvArgs {
+                        nc: nc as u32,
+                        scale: 1.0 / ((nc + 1) as f32).sqrt(),
+                        push: boundary as u32,
+                    }),
+                ],
+                (MIX_SLICES, 1, 1),
+                (256, 1, 1),
+            )?;
+            self.mix_apply(e, &a.blocks, *n_blocks, &a.cur, 1, &a.m, nt)?;
+            rec(e, "attn_out", s, &a.attn, 0, d)?;
+            rec(e, "ffn_inp", s, &a.cur, 0, d)?;
+        } else {
+            // on a boundary the conv does not read a.h, so the push can run alongside it
+            e.parallel(|e| {
+                if boundary {
+                    self.copy(e, &a.h, 0, &a.blocks, blk * plane, nt * d)?;
+                }
+                self.conv(
+                    e,
+                    &a.wo_out,
+                    &slot.conv[2],
+                    lw.attn_post_conv,
+                    None,
+                    &a.attn,
+                    0,
+                    second,
+                    d,
+                    nt,
+                    self.snap_off(sid, 2),
+                )
+            })?;
+            self.conv_hist(e, &a.wo_out, &slot.conv[2], d, nt)?;
+            rec(e, "attn_out", s, &a.attn, 0, d)?;
+            rec(e, "ffn_inp", s, &a.cur, 0, d)?;
+            self.mix(
+                e,
+                &a.blocks,
+                *n_blocks,
+                &a.cur,
+                lw.ffn_res_query,
+                1,
+                &a.m,
+                nt,
+            )?;
+        }
         if msgs {
             let g = &self.loops[il - hp.loop_start].gates[3];
             self.msg_gate(e, g, &a.m, 0, &a.msgs, 3 * plane, &a.m, 0, nt)?;

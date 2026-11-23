@@ -334,7 +334,12 @@ fn empty_prefixes() -> &'static [String] {
     static P: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     P.get_or_init(|| {
         std::env::var("INKLING_EMPTY")
-            .map(|v| v.split(',').filter(|s| !s.is_empty()).map(str::to_string).collect())
+            .map(|v| {
+                v.split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
             .unwrap_or_default()
     })
 }
@@ -427,7 +432,14 @@ impl Encoder<'_> {
         }
         // INKLING_EMPTY=<prefix>[,...]: run an empty kernel with the same grid in place of matching
         // ones, separating fixed dispatch/barrier cost from kernel work (timing only)
-        let kernel = if empty_prefixes().iter().any(|p| kernel.starts_with(p.as_str())) { "empty_probe" } else { kernel };
+        let kernel = if empty_prefixes()
+            .iter()
+            .any(|p| kernel.starts_with(p.as_str()))
+        {
+            "empty_probe"
+        } else {
+            kernel
+        };
         let args: &[Arg] = if kernel == "empty_probe" { &[] } else { args };
         let p = self.ctx.pipeline(kernel)?;
         // a kernel's register use can lower its thread limit below what the caller dispatches;
@@ -519,8 +531,13 @@ impl Encoder<'_> {
     pub fn parallel(&mut self, f: impl FnOnce(&mut Self) -> Result<()>) -> Result<()> {
         assert!(!self.in_parallel, "nested parallel groups");
         self.in_parallel = true;
+        let before = self.n_dispatch;
         let r = f(self);
         self.in_parallel = false;
+        // an empty group (e.g. conv history updates, which are no-ops for one token) needs no barrier
+        if self.n_dispatch == before {
+            return r;
+        }
         if let Some(enc) = &self.enc {
             enc.memoryBarrierWithScope(MTLBarrierScope::Buffers);
         }

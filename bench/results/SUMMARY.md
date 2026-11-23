@@ -159,3 +159,17 @@ A prefill token costs ~8.8 GFLOP (experts 63.7M + dense 26.9M multiply-adds per 
 
 MoE tile GEMM variants tried today, all against the current kernel (32/16-pair work-list tiles, 64 rows, 4 simdgroups with 4x2 accumulators per matrix, results from the accumulators): 64-pair tiles, 64-column steps, 8 simdgroups with 2x2, double-buffered pipelining, register prefetch, split gate/up. Every one lost or miscompiled. Packing two small experts into a 32-pair tile would need two weight tiles per threadgroup, the same work as two 16-pair tiles, so it was not tried.
 - rel_table with 8 rows per thread (bias row kept in registers): pp512 448.9 vs 455.2 in an A/B, reverted.
+
+## Decode small ops: latency, not synchronization (2026-11-23, continued)
+
+What the ~6 ms of small decode kernels per token is made of:
+- INKLING_EMPTY (fd6acd3) swaps the small kernels for an empty kernel with the same grid and barrier position: tg128 62.1 with them empty vs 65.2 skipped and 46.6 real (one clean round; a second ran on battery and is void). So dispatch plus barrier costs ~1 us each. The rest is the small kernels' own duration.
+- INKLING_DOUBLE on each small family changes nothing measurable (all within ±0.3 ms): a second, concurrent copy is free, so the kernels are latency-bound. Each one sits on the token's dependent chain (~19 steps per layer pass, ~1000 barriers per token), with only a few threadgroups busy.
+- The serial per-dispatch profile (INKLING_PROFILE=1) gives shares that add up to the measured gap, so they work as a latency ranking: attn_short 5.4%, msg gates 6.1%, depth mix 5.9%, conv_step 2.7%, rms_norm 2.6%, conv_head 2.3%.
+
+Landed:
+- Post-attention conv fused into depth_mix_part, plus no barrier after empty parallel groups (997a092): 1018 → 903 barriers per token, tg128 +0.5%.
+- RMS norm after the depth mix folded into depth_mix_apply through Gram terms; the decode output head mixes block rows in place (df825d6): tg256 +0.4% over three alternating runs, decode KL vs llama.cpp 4.45e-3 (was 4.48e-3).
+- attn_short with a simdgroup per key (coalesced key rows; q.k and the bias row in one simd_sum; V split across the 4 simdgroups): tg256 46.1 vs 45.0 (+2.2%, three alternating runs).
+
+Removing a dependent step is worth ~1-5 us. Shortening the slowest kernels on the chain pays more than removing cheap ones.

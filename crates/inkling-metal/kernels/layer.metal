@@ -1055,30 +1055,28 @@ kernel void attn_short(device const float *q [[buffer(0)]], device const KV *kc 
                        device const float *r [[buffer(3)]], device const float *rel_bias [[buffer(4)]], device const float *sinks [[buffer(5)]],
                        device float *out [[buffer(6)]], device float *gate [[buffer(7)]], constant SplitArgs &a [[buffer(8)]],
                        uint h [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
-    threadgroup float qs[128];
-    threadgroup float rs[32];
     threadgroup float sc[ATTN_SHORT];
+    threadgroup float4 vpart[4][32];
     threadgroup float scratch[32];
+    uint sg = tid / 32, lane = tid % 32;
     uint kvh = h / (a.n_head / a.n_kv_head);
-    qs[tid] = q[h * a.head_dim + tid];
-    if (tid < a.n_rel) rs[tid] = r[h * a.n_rel + tid];
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // a key per simdgroup, 4 dims per lane: each key row is one coalesced read, and the q.k dot and
+    // the bias row (n_rel <= 32) share one simd_sum. A key per thread made every thread walk its own
+    // strided row and then loop over all keys for V.
+    float4 q4 = ((device const float4 *)(q + h * a.head_dim))[lane];
+    float rl = lane < a.n_rel ? r[h * a.n_rel + lane] : 0.0f;
     uint n = a.pos + 1 - a.first;
-    // logits: thread t handles keys t and t + 128 (whole 128-dim dot and its bias row)
+    device const vec<KV, 4> *kb = (device const vec<KV, 4> *)(kc + kvh * a.head_dim) + lane;
+    device const vec<KV, 4> *vb = (device const vec<KV, 4> *)(vc + kvh * a.head_dim) + lane;
+    uint row4 = a.kv_dim / 4;
     float lmax = -INFINITY;
-    for (uint t = tid; t < n; t += 128) {
+    for (uint t = sg; t < n; t += 4) {
         uint j = a.first + t;
-        device const vec<KV, 4> *kr = (device const vec<KV, 4> *)(kc + (ulong)j * a.kv_dim + kvh * a.head_dim);
-        float d = 0.0f;
-        for (uint i = 0; i < 32; ++i) d += dot(((threadgroup const float4 *)qs)[i], float4(kr[i]));
+        float part = dot(q4, float4(kb[(ulong)j * row4])) * a.scale;
         uint dist = a.pos - j;
-        float b = 0.0f;
-        if (dist < a.extent) {
-            device const float *rb = rel_bias + (ulong)dist * a.n_rel;
-            for (uint i = 0; i < a.n_rel; ++i) b += rs[i] * rb[i];
-        }
-        float s = d * a.scale + b;
-        sc[t] = s;
+        if (dist < a.extent && lane < a.n_rel) part += rl * rel_bias[(ulong)dist * a.n_rel + lane];
+        float s = simd_sum(part);
+        if (lane == 0) sc[t] = s;
         lmax = max(lmax, s);
     }
     float sink = sinks[h];
@@ -1091,13 +1089,18 @@ kernel void attn_short(device const float *q [[buffer(0)]], device const KV *kc 
     }
     float total = tg_sum(lsum, scratch, tid, 128) + exp(sink - m);
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    device const KV *vp = vc + (ulong)a.first * a.kv_dim + kvh * a.head_dim + tid;
-    float acc = 0.0f;
-    for (uint t = 0; t < n; ++t) acc += sc[t] * float(vp[(ulong)t * a.kv_dim]);
-    uint i = h * a.head_dim + tid;
-    float o = acc / total;
-    out[i] = o;
-    gate[i] = o * sigmoidf(gate[i]);
+    float4 acc = 0.0f;
+    for (uint t = sg; t < n; t += 4) acc += sc[t] * float4(vb[(ulong)(a.first + t) * row4]);
+    vpart[sg][lane] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+        float4 o = (vpart[0][lane] + vpart[1][lane] + vpart[2][lane] + vpart[3][lane]) / total;
+        uint i = h * a.head_dim + 4 * lane;
+        device float4 *g4 = (device float4 *)(gate + i);
+        *(device float4 *)(out + i) = o;
+        float4 gv = *g4;
+        *g4 = o / (1.0f + exp(-gv));
+    }
 }
 
 template [[host_name("attn_short_f32")]] kernel void attn_short<float>(device const float *, device const float *, device const float *,

@@ -153,3 +153,5 @@ Decode with every non-weight kernel skipped (INKLING_SKIP, timing bound only) ru
 Measured matrix-unit peak (examples/kernel_bw.rs mma_peak: 8x8 simdgroup multiply-accumulates, registers only): 7.98 TFLOP/s f16, 7.80 f32 (no doubled f16 rate on this GPU).
 
 A prefill token costs ~8.8 GFLOP (experts 63.7M + dense 26.9M multiply-adds per layer pass, 48 passes; attention ~0.08G at these lengths). pp512 at 443 tok/s = 3.9 TFLOP/s, ~49% of peak. The GEMMs run at 56-68% (dense 5.5, expert gate/up 4.7, expert down 4.5 TFLOP/s) and take ~79% of the batch; the other ~21% is attention, the bias table, convs, depth mix, norms and the router. llama.cpp's best build (378 tok/s) is ~42% of peak. Decode, by contrast, is at 96% of the bandwidth limit in its weight kernels.
+- Dense prefill GEMM software-pipelined (c5d8eda): +0.8% (pp512 447.3 vs 443.6), kept.
+- MoE tile GEMMs: double-buffered pipelining pp512 402.5 (halved occupancy); single-buffer register prefetch 428.5 (~36 more registers per thread). Both reverted. The MoE kernels are occupancy-bound, so anything that costs threadgroup memory or registers loses.

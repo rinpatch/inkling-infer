@@ -1,0 +1,13 @@
+# Overlay on mini-swe-agent's swebench.yaml for a local OpenAI-compatible server.
+# API base and model name come from the run script (-c model.model_kwargs.api_base=...).
+agent:
+  step_limit: 100
+  cost_limit: 0
+model:
+  model_name: openai/inkling-2-mini
+  cost_tracking: ignore_errors
+  model_kwargs:
+    api_key: none
+    timeout: 3600
+    drop_params: true
+    parallel_tool_calls: true

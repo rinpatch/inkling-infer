@@ -192,69 +192,6 @@ inline void mma_4x2(threadgroup const E *Wt, threadgroup const E *Xt, thread sim
     }
 }
 
-// ---- several Q8_0 matrices sharing one input, 64-row tiles ---------------------------------------
-// out_s[t][r] = W_s[r] . x[t] for several Q8_0 matrices sharing one input (segment concatenation
-// as in mv_q8_0_multi), with the 4x2-accumulator layout of the expert GEMMs.
-// Grid: (ceil(total_rows/BM2), ceil(n_tokens/BN)), 128 threads.
-template <typename E>
-kernel void gemm2_q8_0_multi(device const uchar *W [[buffer(0)]], device const float *x [[buffer(1)]], device float *o0 [[buffer(2)]],
-                             device float *o1 [[buffer(3)]], device float *o2 [[buffer(4)]], device float *o3 [[buffer(5)]],
-                             device float *o4 [[buffer(6)]], device float *o5 [[buffer(7)]], device float *o6 [[buffer(8)]],
-                             device float *o7 [[buffer(9)]], constant GMultiArgs &a [[buffer(10)]], uint2 tg [[threadgroup_position_in_grid]],
-                             uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
-                             uint lane [[thread_index_in_simdgroup]]) {
-    // only the k loop's tiles in threadgroup memory (results go straight from the accumulators),
-    // so several threadgroups fit per core
-    threadgroup E Wt[BM2 * BK], Xt[BN * BK];
-    uint r0 = tg.x * BM2, t0 = tg.y * BN;
-    uint nb = a.cols / QK;
-    simdgroup_float8x8 acc[4][2];
-    for (uint i = 0; i < 4; ++i)
-        for (uint j = 0; j < 2; ++j) acc[i][j] = simdgroup_float8x8(0);
-    uint wr = tid / 2, wh = tid % 2;
-    uint xr = tid / 4, xp = tid % 4;
-    uint gr = r0 + wr;
-    device const block_q8_0 *wrow = nullptr;
-    if (gr < a.total_rows) {
-        uint s = 0;
-        while (s + 1 < a.n_seg && gr >= a.seg[s + 1].start) ++s;
-        wrow = (device const block_q8_0 *)(W + a.seg[s].woff) + (ulong)(gr - a.seg[s].start) * nb;
-    }
-    uint tt = t0 + xr;
-    for (uint b = 0; b < nb; ++b) {
-        for (uint q = 0; q < 2; ++q) {
-            uint part = wh * 2 + q;
-            if (wrow) deq_block(wrow, b, Wt + wr * BK, part, (threadgroup const float *)nullptr);
-            else for (uint j = 0; j < 8; ++j) Wt[wr * BK + part * 8 + j] = E(0);
-        }
-        for (uint j = 0; j < 8; ++j) Xt[xr * BK + xp * 8 + j] = E(tt < a.n_tokens ? x[(ulong)tt * a.cols + b * QK + xp * 8 + j] : 0.0f);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        mma_4x2(Wt, Xt, acc, sg);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    device float *outs[MULTI_MAX] = {o0, o1, o2, o3, o4, o5, o6, o7};
-    // lane holds row fm and columns fn, fn+1 of each 8x8 accumulator (Apple simdgroup layout)
-    const uint fm = ((lane / 4) & 4) + (lane / 2) % 4, fn = ((lane / 4) & 2) * 2 + (lane % 2) * 2;
-    const uint rb = (sg / 2) * 32, tb = (sg % 2) * 16;
-    for (uint i = 0; i < 4; ++i) {
-        uint row = r0 + rb + 8 * i + fm;
-        if (row >= a.total_rows) continue;
-        uint s = 0;
-        while (s + 1 < a.n_seg && row >= a.seg[s + 1].start) ++s;
-        for (uint j = 0; j < 2; ++j)
-            for (uint q = 0; q < 2; ++q) {
-                uint tok = t0 + tb + 8 * j + fn + q;
-                if (tok < a.n_tokens) outs[s][(ulong)tok * a.seg[s].rows + row - a.seg[s].start] = acc[i][j].thread_elements()[q];
-            }
-    }
-}
-
-#define MULTI2_INSTANCE(E, name)                                                                                                        \
-    template [[host_name("gemm2_q8_0_multi_" name)]] kernel void gemm2_q8_0_multi<E>(                                                    \
-        device const uchar *, device const float *, device float *, device float *, device float *, device float *, device float *,      \
-        device float *, device float *, device float *, constant GMultiArgs &, uint2, uint, uint, uint);
-MULTI2_INSTANCE(half, "f16")
-MULTI2_INSTANCE(float, "f32")
 
 // ---- MoE GEMMs over a tile list, 32- or 16-pair tiles ---------------------------------------------
 // Routing is uneven (512-token batch: median 18 pairs per expert, max 180), so one-size 32-pair
@@ -430,3 +367,92 @@ kernel void mma_peak(device float *out [[buffer(0)]], constant uint &iters [[buf
 }
 template [[host_name("mma_peak_f16")]] kernel void mma_peak<simdgroup_half8x8>(device float *, constant uint &, uint, uint);
 template [[host_name("mma_peak_f32")]] kernel void mma_peak<simdgroup_float8x8>(device float *, constant uint &, uint, uint);
+
+// gemm2_q8_0_multi, software-pipelined: step b+1's weights (2 x 8 int8 + scale per thread) and
+// inputs (8 floats) are fetched into registers before step b's multiplies and stored into the
+// other half of a double-buffered tile afterwards, so device latency overlaps the MMAs and each
+// step needs one barrier instead of two.
+template <typename E>
+kernel void gemm2p_q8_0_multi(device const uchar *W [[buffer(0)]], device const float *x [[buffer(1)]], device float *o0 [[buffer(2)]],
+                              device float *o1 [[buffer(3)]], device float *o2 [[buffer(4)]], device float *o3 [[buffer(5)]],
+                              device float *o4 [[buffer(6)]], device float *o5 [[buffer(7)]], device float *o6 [[buffer(8)]],
+                              device float *o7 [[buffer(9)]], constant GMultiArgs &a [[buffer(10)]], uint2 tg [[threadgroup_position_in_grid]],
+                              uint tid [[thread_index_in_threadgroup]], uint sg [[simdgroup_index_in_threadgroup]],
+                              uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup E Wt[2][BM2 * BK], Xt[2][BN * BK];
+    uint r0 = tg.x * BM2, t0 = tg.y * BN;
+    uint nb = a.cols / QK;
+    simdgroup_float8x8 acc[4][2];
+    for (uint i = 0; i < 4; ++i)
+        for (uint j = 0; j < 2; ++j) acc[i][j] = simdgroup_float8x8(0);
+    uint wr = tid / 2, wh = tid % 2;
+    uint xr = tid / 4, xp = tid % 4;
+    uint gr = r0 + wr;
+    device const block_q8_0 *wrow = nullptr;
+    if (gr < a.total_rows) {
+        uint s = 0;
+        while (s + 1 < a.n_seg && gr >= a.seg[s + 1].start) ++s;
+        wrow = (device const block_q8_0 *)(W + a.seg[s].woff) + (ulong)(gr - a.seg[s].start) * nb;
+    }
+    uint tt = t0 + xr;
+    bool tok_ok = tt < a.n_tokens;
+    device const float *xrow = x + (ulong)(tok_ok ? tt : 0) * a.cols;
+    // register staging for one step: this thread's 16 weights (parts wh*2, wh*2+1) and 8 inputs
+    char4 qw[4];
+    float dw = 0.0f;
+    float4 xv[2];
+#define FETCH(b)                                                                                                     \
+    {                                                                                                                \
+        if (wrow) {                                                                                                  \
+            device const block_q8_0 *blk = wrow + (b);                                                               \
+            dw = float(blk->d);                                                                                      \
+            device const packed_char4 *qp = (device const packed_char4 *)(blk->qs + wh * 16);                        \
+            for (uint j = 0; j < 4; ++j) qw[j] = char4(qp[j]);                                                       \
+        }                                                                                                            \
+        device const float4 *xp4 = (device const float4 *)(xrow + (b) * QK + xp * 8);                                \
+        xv[0] = tok_ok ? xp4[0] : float4(0);                                                                         \
+        xv[1] = tok_ok ? xp4[1] : float4(0);                                                                         \
+    }
+#define STORE(buf)                                                                                                   \
+    {                                                                                                                \
+        for (uint j = 0; j < 4; ++j)                                                                                 \
+            for (uint k = 0; k < 4; ++k) Wt[buf][wr * BK + wh * 16 + j * 4 + k] = E(wrow ? dw * float(qw[j][k]) : 0.0f); \
+        for (uint k = 0; k < 4; ++k) {                                                                               \
+            Xt[buf][xr * BK + xp * 8 + k] = E(xv[0][k]);                                                             \
+            Xt[buf][xr * BK + xp * 8 + 4 + k] = E(xv[1][k]);                                                         \
+        }                                                                                                            \
+    }
+    FETCH(0u);
+    STORE(0u);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint b = 0; b < nb; ++b) {
+        uint cur = b & 1;
+        if (b + 1 < nb) FETCH(b + 1);
+        mma_4x2(Wt[cur], Xt[cur], acc, sg);
+        if (b + 1 < nb) STORE(cur ^ 1);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+#undef FETCH
+#undef STORE
+    device float *outs[MULTI_MAX] = {o0, o1, o2, o3, o4, o5, o6, o7};
+    const uint fm = ((lane / 4) & 4) + (lane / 2) % 4, fn = ((lane / 4) & 2) * 2 + (lane % 2) * 2;
+    const uint rb = (sg / 2) * 32, tb = (sg % 2) * 16;
+    for (uint i = 0; i < 4; ++i) {
+        uint row = r0 + rb + 8 * i + fm;
+        if (row >= a.total_rows) continue;
+        uint s = 0;
+        while (s + 1 < a.n_seg && row >= a.seg[s + 1].start) ++s;
+        for (uint j = 0; j < 2; ++j)
+            for (uint q = 0; q < 2; ++q) {
+                uint tok = t0 + tb + 8 * j + fn + q;
+                if (tok < a.n_tokens) outs[s][(ulong)tok * a.seg[s].rows + row - a.seg[s].start] = acc[i][j].thread_elements()[q];
+            }
+    }
+}
+
+#define MULTI2P_INSTANCE(E, name)                                                                                                       \
+    template [[host_name("gemm2p_q8_0_multi_" name)]] kernel void gemm2p_q8_0_multi<E>(                                                  \
+        device const uchar *, device const float *, device float *, device float *, device float *, device float *, device float *,      \
+        device float *, device float *, device float *, constant GMultiArgs &, uint2, uint, uint, uint);
+MULTI2P_INSTANCE(half, "f16")
+MULTI2P_INSTANCE(float, "f32")

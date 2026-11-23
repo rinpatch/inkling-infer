@@ -1147,10 +1147,12 @@ impl MetalModel {
                 (32 * MV_SG, 1, 1),
             );
         }
+        // software-pipelined tiles (next step's loads overlap this step's multiplies)
+        let base = "gemm2p_q8_0_multi";
         let kernel = if f32_tiles {
-            "gemm2_q8_0_multi_f32".to_string()
+            format!("{base}_f32")
         } else {
-            self.tile("gemm2_q8_0_multi")
+            self.tile(base)
         };
         e.dispatch(
             &kernel,

@@ -198,3 +198,50 @@ fn speculative_matches_greedy() {
         "the drafter's guesses are almost never accepted"
     );
 }
+
+/// Sliding-window slots keep a bounded buffer and move their newest rows to the front when it
+/// fills. With no slack (INKLING_SWA_SLACK=0: 2560 rows, compacting every ~1500 tokens) prefill,
+/// pipelined decode and single steps must give exactly what an uncompacted cache gives.
+#[test]
+fn swa_compaction_matches_full_cache() {
+    let Some(mp) = model_path() else {
+        eprintln!("SKIP: model not found");
+        return;
+    };
+    let toks = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/out/swa/tokens.txt"),
+    );
+    let Ok(toks) = toks else {
+        eprintln!("SKIP: fixtures/out/swa missing");
+        return;
+    };
+    let prompt: Vec<u32> = toks
+        .lines()
+        .map(|l| l.trim().parse().unwrap())
+        .take(3000)
+        .collect();
+    let g = gguf::Gguf::open(mp).unwrap();
+    let hp = Hparams::from_gguf(&g).unwrap();
+    let ctx = 4096;
+    let opts = Options {
+        kv_f16: true,
+        gate_f16: true,
+    };
+    // SAFETY: tests run one per process under nextest; nothing else reads the environment here
+    unsafe { std::env::set_var("INKLING_SWA_SLACK", "0") };
+    let mut small = MetalModel::with_options(&g, hp.clone(), ctx, opts).unwrap();
+    unsafe { std::env::remove_var("INKLING_SWA_SLACK") };
+    let mut full = MetalModel::with_options(&g, hp.clone(), ctx, opts).unwrap();
+
+    let a = small.prefill(&prompt).unwrap();
+    let b = full.prefill(&prompt).unwrap();
+    assert_eq!(a, b, "prefill logits");
+    let first = argmax(&a);
+    let ta = small.decode_greedy(first, 300).unwrap();
+    let tb = full.decode_greedy(first, 300).unwrap();
+    assert_eq!(ta, tb, "pipelined decode tokens");
+    let next = *ta.last().unwrap();
+    let la = small.step(next, &mut inkling::NoTrace).unwrap();
+    let lb = full.step(next, &mut inkling::NoTrace).unwrap();
+    assert_eq!(la, lb, "step logits after compactions");
+}

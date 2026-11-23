@@ -21,9 +21,9 @@ use serde_json::{Value, json};
 
 const CHECKPOINT_EVERY: usize = 4096;
 const MAX_CHECKPOINTS: usize = 24;
-/// Greedy decoding runs this many steps per GPU round trip (decode_greedy); a stop is noticed at
-/// the end of a chunk, and the tokens after it are discarded.
-const GREEDY_CHUNK: usize = 16;
+/// Pipelined decoding (greedy or plain temperature sampling, picked on the GPU) runs this many
+/// steps per call; a stop is noticed at the end of a chunk, and the tokens after it are discarded.
+const PIPELINE_CHUNK: usize = 16;
 
 pub struct ServeArgs {
     model: String,
@@ -492,7 +492,7 @@ impl Cache {
             match self
                 .snaps
                 .iter()
-                .filter(|s| s.pos <= target)
+                .filter(|s| s.pos <= target && m.can_restore(s))
                 .max_by_key(|s| s.pos)
             {
                 Some(s) => m.load_state(s),
@@ -670,10 +670,11 @@ fn run_job(
             if room == 0 {
                 break;
             }
-            if p.temperature <= 0.0 {
-                // greedy: the pick stays on the GPU for a chunk of steps
-                let chunk = GREEDY_CHUNK.min(room);
-                let got = m.decode_greedy(next, chunk)?;
+            if p.top_p >= 1.0 {
+                // the pick stays on the GPU for a chunk of steps (top-p needs the CPU sampler)
+                let chunk = PIPELINE_CHUNK.min(room);
+                let seed = p.seed ^ (n as u64).wrapping_mul(0xD1B54A32D192ED03);
+                let got = m.decode_pipelined(next, chunk, p.temperature, seed)?;
                 cache.tokens.push(next);
                 cache.tokens.extend_from_slice(&got[..chunk - 1]);
                 for &t in &got[..chunk - 1] {

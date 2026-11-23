@@ -189,6 +189,8 @@ struct MultiArgs {
 struct ArgmaxArgs {
     n: u32,
     out_index: u32,
+    inv_temp: f32,
+    seed: u32,
 }
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -261,6 +263,18 @@ const MOE_NR: usize = 2;
 pub const MAX_VERIFY: usize = 8;
 /// Visible keys up to which decode attention runs in one pass (kernels/layer.metal ATTN_SHORT).
 const ATTN_SHORT: usize = 256;
+/// Sliding-window slots keep only recent rows: when a batch would run past the buffer, the newest
+/// window + SWA_SLACK rows move to the front and `swa_base` advances. The slack keeps server
+/// snapshots from the last few thousand tokens restorable (`can_restore`).
+const SWA_SLACK: usize = 8192;
+
+/// INKLING_SWA_SLACK overrides SWA_SLACK (tests force frequent compactions with a small one).
+fn swa_slack() -> usize {
+    std::env::var("INKLING_SWA_SLACK")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(SWA_SLACK)
+}
 /// Hidden-dimension slices of the short-batch depth mix (kernels/layer.metal MIX_SLICES, MIX_PART).
 const MIX_SLICES: usize = 9;
 const MIX_PART: usize = 8 * 5 + 8 * 7 / 2;
@@ -398,6 +412,14 @@ pub struct MetalModel {
     max_ctx: usize,
     max_batch: usize,
     pos: usize,
+    /// Absolute position of row 0 in the sliding-window slots' K/V buffers (`swa_rows` rows each;
+    /// full-attention slots hold max_ctx rows from position 0). Advanced inside `encode`.
+    swa_base: std::cell::Cell<usize>,
+    swa_rows: usize,
+    /// Rows kept by a compaction: the window plus the slack.
+    swa_keep: usize,
+    /// Per cache slot: does it belong to a sliding-window layer.
+    swa_slot: Vec<bool>,
     trace_buf: Buffer,
     /// KV cache stored as f16 instead of f32 (fixed at construction; see `Options`).
     kv_f16: bool,
@@ -609,11 +631,26 @@ impl MetalModel {
         let (d, kvd, qd) = (hp.n_embd, hp.kv_dim(), hp.q_dim());
         let hist = hp.n_conv - 1;
         let kv_bytes = if opts.kv_f16 { 2 } else { 4 };
+        let mut swa_slot = vec![false; hp.n_slots()];
+        for il in 0..hp.n_layer {
+            let passes = if il >= hp.loop_start && il < hp.loop_end {
+                hp.loop_passes
+            } else {
+                1
+            };
+            for pass in 0..passes {
+                swa_slot[hp.slot(il, pass)] = hp.is_swa[il];
+            }
+        }
+        // compaction copies rows [keep, 2 keep) or later onto [0, keep): never overlapping
+        let swa_keep = hp.n_swa + swa_slack();
+        let swa_rows = max_ctx.min(2 * swa_keep + MAX_BATCH);
         let mut slots = Vec::with_capacity(hp.n_slots());
-        for _ in 0..hp.n_slots() {
+        for &swa in &swa_slot {
+            let rows = if swa { swa_rows } else { max_ctx };
             slots.push(SlotBufs {
-                k: ctx.buffer(max_ctx * kvd * kv_bytes)?,
-                v: ctx.buffer(max_ctx * kvd * kv_bytes)?,
+                k: ctx.buffer(rows * kvd * kv_bytes)?,
+                v: ctx.buffer(rows * kvd * kv_bytes)?,
                 conv: [
                     ctx.buffer(hist * kvd * f)?,
                     ctx.buffer(hist * kvd * f)?,
@@ -689,6 +726,10 @@ impl MetalModel {
             a,
             max_ctx,
             max_batch: MAX_BATCH,
+            swa_base: std::cell::Cell::new(0),
+            swa_rows,
+            swa_keep,
+            swa_slot,
             gate16,
             exact_prefill: std::env::var_os("INKLING_EXACT_PREFILL").is_some(),
             capture: None,
@@ -748,8 +789,20 @@ impl MetalModel {
         }
     }
 
+    /// Whether `load_state(st)` would see every K/V row it needs: the sliding-window rows before
+    /// st.pos may have been dropped by a compaction since.
+    pub fn can_restore(&self, st: &SeqState) -> bool {
+        let base = self.swa_base.get();
+        base == 0 || st.pos >= base + self.hp.n_swa
+    }
+
     /// Returns to a snapshot from `save_state`, dropping everything after its position.
     pub fn load_state(&mut self, st: &SeqState) {
+        assert!(
+            self.can_restore(st),
+            "snapshot at {} predates the sliding-window rows",
+            st.pos
+        );
         self.pos = st.pos;
         self.dr_set_len(0);
         let mut off = 0;
@@ -766,6 +819,7 @@ impl MetalModel {
     /// clearing.
     pub fn reset(&mut self) {
         self.pos = 0;
+        self.swa_base.set(0);
         self.dr_set_len(0);
         for s in &self.slots {
             for c in &s.conv {
@@ -849,6 +903,18 @@ impl MetalModel {
     /// argmax that writes the next input token, so steps are queued back to back (two command
     /// buffers in flight) while the CPU encodes ahead. Returns the generated tokens.
     pub fn decode_greedy(&mut self, first: u32, n: usize) -> Result<Vec<u32>> {
+        self.decode_pipelined(first, n, 0.0, 0)
+    }
+
+    /// `decode_greedy` with temperature sampling: each pick is a Gumbel-max draw from
+    /// softmax(logits / temp) (exact; no top-p), seeded per step from `seed`. temp 0 is greedy.
+    pub fn decode_pipelined(
+        &mut self,
+        first: u32,
+        n: usize,
+        temp: f32,
+        seed: u64,
+    ) -> Result<Vec<u32>> {
         if self.pos + n > self.max_ctx {
             return Err(Error::Model(inkling::Error::ContextFull(self.pos + n)));
         }
@@ -876,6 +942,10 @@ impl MetalModel {
                         bytes(&ArgmaxArgs {
                             n: this.hp.n_vocab as u32,
                             out_index: i as u32,
+                            inv_temp: if temp > 0.0 { 1.0 / temp } else { 0.0 },
+                            // a distinct stream per step: mix the step into the seed
+                            seed: ((seed ^ (this.pos as u64).wrapping_mul(0x9E3779B97F4A7C15))
+                                >> 17) as u32,
                         }),
                     ],
                     (1, 1, 1),
@@ -1998,7 +2068,10 @@ impl MetalModel {
                 self.proj(e, &a.n_qkv, 2 * plane, &v_side, nt)
             })?;
         }
-        let kv_off = self.pos * kvd;
+        // K/V rows of this slot are numbered from `base`; attention only uses position
+        // differences, so it runs on positions shifted by the same amount
+        let base = if lw.is_swa { self.swa_base.get() } else { 0 };
+        let kv_off = (self.pos - base) * kvd;
         // q clip, the K and V convs into the cache, and the r clip touch disjoint buffers
         e.parallel(|e| {
             self.clip(
@@ -2131,8 +2204,8 @@ impl MetalModel {
                             n_head: nh as u32,
                             n_kv_head: nkv as u32,
                             n_rel: nr as u32,
-                            pos: self.pos as u32,
-                            first: first as u32,
+                            pos: (self.pos - base) as u32,
+                            first: (first - base) as u32,
                             extent: lw.rel_extent as u32,
                             scale: 1.0 / (hd as f32).sqrt(),
                             kv_dim: kvd as u32,
@@ -2171,8 +2244,8 @@ impl MetalModel {
                             n_head: nh as u32,
                             n_kv_head: nkv as u32,
                             n_rel: nr as u32,
-                            pos: self.pos as u32,
-                            first: first as u32,
+                            pos: (self.pos - base) as u32,
+                            first: (first - base) as u32,
                             extent: lw.rel_extent as u32,
                             scale: 1.0 / (hd as f32).sqrt(),
                             kv_dim: kvd as u32,
@@ -2239,7 +2312,7 @@ impl MetalModel {
                         n_tokens: nt as u32,
                         n_head: nh as u32,
                         n_kv_head: nkv as u32,
-                        pos0: self.pos as u32,
+                        pos0: (self.pos - base) as u32,
                         n_swa: if lw.is_swa { hp.n_swa as u32 } else { 0 },
                         extent: lw.rel_extent as u32,
                         scale: 1.0 / (hd as f32).sqrt(),
@@ -2458,6 +2531,21 @@ impl MetalModel {
         let a = &self.a;
         let d = hp.n_embd;
         let plane = self.max_batch * d;
+
+        let base = self.swa_base.get();
+        if self.pos + nt - base > self.swa_rows {
+            let keep = self.swa_keep;
+            let new_base = self.pos - keep;
+            let row = hp.kv_dim() * self.kv_bytes() / 4;
+            e.parallel(|e| {
+                for (sl, _) in self.slots.iter().zip(&self.swa_slot).filter(|x| *x.1) {
+                    self.copy(e, &sl.k, (new_base - base) * row, &sl.k, 0, keep * row)?;
+                    self.copy(e, &sl.v, (new_base - base) * row, &sl.v, 0, keep * row)?;
+                }
+                Ok(())
+            })?;
+            self.swa_base.set(new_base);
+        }
 
         e.dispatch(
             "embed_q8_0",

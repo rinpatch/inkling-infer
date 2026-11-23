@@ -1,7 +1,7 @@
 #!/bin/sh
 # llama.cpp baseline for the IQ4_NL GGUF. Run on a quiet machine (see bench/README.md).
 set -eu
-LLAMA=${LLAMA:-$HOME/sw/llama.cpp}
+LLAMA=${LLAMA:-$(cd "$(dirname "$0")/.." && pwd)/../llama.cpp}
 M=${INKLING_MODEL:-$(ls "$HOME"/.cache/huggingface/hub/models--ggml-org--Inkling-2-Mini-GGUF/snapshots/*/Inkling-2-Mini-IQ4_NL.gguf)}
 B=$LLAMA/build/bin/llama-bench
 C=$(git -C "$LLAMA" rev-parse --short HEAD)

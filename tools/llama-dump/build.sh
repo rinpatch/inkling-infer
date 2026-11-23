@@ -1,8 +1,8 @@
 #!/bin/sh
 # Builds llama-dump against the llama.cpp checkout used as the oracle.
 set -eu
-LLAMA=${LLAMA:-$HOME/sw/llama.cpp}
 here=$(cd "$(dirname "$0")" && pwd)
+LLAMA=${LLAMA:-$here/../../../llama.cpp}
 clang++ -std=c++17 -O2 \
   -I"$LLAMA/include" -I"$LLAMA/ggml/include" -I"$LLAMA/common" \
   "$here/dump.cpp" -o "$here/llama-dump" \

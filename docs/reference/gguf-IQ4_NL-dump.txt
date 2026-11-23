@@ -1,4 +1,4 @@
-INFO:gguf-dump:* Loading: /Users/rin/.cache/huggingface/hub/models--ggml-org--Inkling-2-Mini-GGUF/snapshots/db61c5b492a6a034d986328d28274af0a439aa6c/Inkling-2-Mini-IQ4_NL.gguf
+INFO:gguf-dump:* Loading: ~/.cache/huggingface/hub/models--ggml-org--Inkling-2-Mini-GGUF/snapshots/db61c5b492a6a034d986328d28274af0a439aa6c/Inkling-2-Mini-IQ4_NL.gguf
 * File is LITTLE endian, script is running on a LITTLE endian host.
 * Dumping 66 key/value pair(s)
       1: UINT32     |        1 | GGUF.version = 3

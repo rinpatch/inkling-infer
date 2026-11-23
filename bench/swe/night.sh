@@ -1,14 +1,15 @@
 #!/bin/bash
 # Runs the SWE-bench comparison end to end, one engine at a time (see bench/swe/README.md):
-# start the server, run mini-swe-agent on the 20 instances, stop the server, score on nanakusa.
+# start the server, run mini-swe-agent on the 20 instances, stop the server, score on $SCORE_HOST.
 # usage: bench/swe/night.sh [inkling] [llama] [ollama]   (default: all three, in that order)
 # Re-running resumes: mini-swe-agent skips instances that already have a trajectory.
 set -u
 repo=$(cd "$(dirname "$0")/../.." && pwd)
 runs=$repo/bench/swe/runs
+[ -f "$repo/bench/swe/local.env" ] && . "$repo/bench/swe/local.env"
 M=$(ls "$HOME"/.cache/huggingface/hub/models--ggml-org--Inkling-2-Mini-GGUF/snapshots/*/Inkling-2-Mini-IQ4_NL.gguf)
 CTX=131072
-LLAMA_SERVER=${LLAMA_SERVER:-$HOME/sw/llama-prs/fa/build/bin/llama-server}
+LLAMA_SERVER=${LLAMA_SERVER:-llama-server}
 OLLAMA_TAG=${OLLAMA_TAG:-inkling-2-mini:26b-a5b-nvfp4}
 
 log() { echo "[$(date '+%H:%M:%S')] $*"; }

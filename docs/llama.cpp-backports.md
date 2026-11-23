@@ -1,7 +1,7 @@
 # Possible llama.cpp improvements for Inkling 2
 
 Findings from building inkling-infer, for later. Nothing here has been tried in llama.cpp yet, and nothing goes upstream without review.
-Checked against `~/sw/llama.cpp` at the commit used for the benchmarks in bench/results/SUMMARY.md.
+Checked against llama.cpp at the commit used for the benchmarks in bench/results/SUMMARY.md.
 
 ## 1. Flash attention never runs for Inkling 2 (biggest)
 
@@ -30,7 +30,7 @@ What inkling-infer does: per (token, head), project r onto the bias table once (
 
 ## 2. Tokenizer: `ignore_merges` missing
 
-See docs/llama.cpp-tokenizer-bug.md (and ~/sw/llama.cpp/INKLING2_TOKENIZER_BUG.md). A correctness fix, not speed.
+See docs/llama.cpp-tokenizer-bug.md. A correctness fix, not speed.
 
 ## Looked at, probably not worth upstreaming
 

@@ -5,7 +5,7 @@
     "cpu_info": "Accelerate, Apple M4 Pro",
     "gpu_info": "Apple M4 Pro",
     "backends": "MTL,BLAS",
-    "model_filename": "/Users/rin/.cache/huggingface/hub/models--ggml-org--Inkling-2-Mini-GGUF/snapshots/db61c5b492a6a034d986328d28274af0a439aa6c/Inkling-2-Mini-IQ4_NL.gguf",
+    "model_filename": "~/.cache/huggingface/hub/models--ggml-org--Inkling-2-Mini-GGUF/snapshots/db61c5b492a6a034d986328d28274af0a439aa6c/Inkling-2-Mini-IQ4_NL.gguf",
     "model_type": "inkling2_loop ?B IQ4_NL - 4.5 bpw",
     "model_size": 17615963136,
     "model_n_params": 26070385152,

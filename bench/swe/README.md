@@ -11,17 +11,17 @@ Run it only when the user says so: it keeps the GPU busy for many hours.
 ## Layout
 
 - Model servers run on this Mac (M4 Pro, 48 GB). One engine at a time; nothing else on the GPU.
-- Agent containers and scoring run on `nanakusa` (x86-64 Linux, 4 cores, 16 GB; `ssh nanakusa`
-  works with keys, user `rin` is in the `docker` group). The Mac cannot hold the model and the
-  Docker VM at once. mini-swe-agent reaches it through `DOCKER_HOST=ssh://nanakusa`.
+- Agent containers and scoring run on a separate x86-64 Linux Docker host: the Mac cannot hold
+  the model and a Docker VM at once. Put `DOCKER_HOST` (e.g. `ssh://<host>`), `SCORE_HOST` and
+  `LLAMA_SERVER` in `bench/swe/local.env` (not in git); the scripts source it.
 - `instances.txt`: 20 instances, SWE-bench Verified difficulty "<15 min fix", seed 0.
-  Their images (`swebench/sweb.eval.x86_64.*`) are already pulled on nanakusa.
+  Pull their images (`swebench/sweb.eval.x86_64.*`) on the Docker host beforehand.
 - `local.yaml`: overlay on mini-swe-agent's `swebench.yaml` (step limit 100, no cost limit, cost
   tracking off, API base set by `run.sh`). Sampling and thinking effort are each engine's and the
   model's defaults (temperature 1.0, template effort 0.9).
 - Agent venv: `bench/engines/swe/.venv` (mini-swe-agent, datasets; not in git). Recreate with
   `uv venv -p 3.12 bench/engines/swe/.venv && uv pip install -p bench/engines/swe/.venv/bin/python mini-swe-agent datasets`.
-- Scoring venv: `nanakusa:~/swe-eval/.venv` (swebench 5.0.2, via `~/.local/bin/uv`). Use dataset
+- Scoring venv: `~/swe-eval/.venv` on the scoring host (swebench 5.0.2). Use dataset
   `SWE-bench/SWE-bench_Verified` (the princeton-nlp name lacks the `image` field 5.x needs).
 
 ## Engines
@@ -29,7 +29,7 @@ Run it only when the user says so: it keeps the GPU busy for many hours.
 | label | server | weights | context |
 |---|---|---|---|
 | `inkling` | `target/release/inkling serve` (this repo) | IQ4_NL GGUF | 131072 |
-| `llama` | llama.cpp #32808 build, `~/sw/llama-prs/fa/build/bin/llama-server -c 131072 -np 1 -fa on --jinja` | same GGUF | 131072 |
+| `llama` | llama.cpp #32808 build, `$LLAMA_SERVER -c 131072 -np 1 -fa on --jinja` | same GGUF | 131072 |
 | `ollama` | `OLLAMA_CONTEXT_LENGTH=131072 ollama serve`, tag `inkling-2-mini:26b-a5b-nvfp4` | official NVFP4 (+ DSpark drafter) | 131072 |
 
 `-np 1` matters: llama-server otherwise splits the context across parallel slots. Ollama's
@@ -42,8 +42,7 @@ Before starting:
 1. Mac plugged in (`pmset -g batt` says AC Power), no other GPU jobs (`pgrep -fl "inkling|llama|ollama|nextest"`),
    no Ollama app running (ports 8080, 8081, 11434 free; `night.sh` checks).
 2. `cargo build --release -p inkling-cli` (the server must be built from the commit being measured).
-3. `ssh nanakusa docker ps` works; `ssh nanakusa 'docker images | grep -c sweb.eval'` prints 20.
-4. OrbStack on the Mac stays stopped (`orb stop`); it is not needed.
+3. `docker ps` works against `$DOCKER_HOST`, and `docker images | grep -c sweb.eval` there prints 20.
 
 Then, in the background (it takes roughly 4-6 h for ours, longer for the other two):
 
@@ -54,7 +53,7 @@ bench/swe/night.sh llama ollama    # a subset; re-running resumes unfinished ins
 
 For each engine it starts the server, waits for health, sends one tool-calling smoke request
 (fails fast if the engine cannot produce tool calls), runs `run.sh`, stops the server, and runs
-`score.sh` on nanakusa. Everything lands in `bench/swe/runs/<label>/`: `preds.json`,
+`score.sh` on the scoring host. Everything lands in `bench/swe/runs/<label>/`: `preds.json`,
 `report.json` (harness result), `server.log`, `agent.log`, `score.log`, `smoke.log`, our
 server's per-request `requests.jsonl`, and one trajectory directory per instance (git-ignored).
 At the end it writes `runs/summary.md` with `summarize.py`.

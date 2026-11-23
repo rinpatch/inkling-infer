@@ -8,3 +8,6 @@ tools/llama-dump/llama-dump
 fixtures/out/
 bench/swe/runs/*/*/
 bench/swe/runs/*/minisweagent.log
+bench/swe/local.env
+bench/swe/LOCAL.md
+CLAUDE.local.md

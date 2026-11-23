@@ -17,4 +17,4 @@ There is no Inkling 2 technical report. The exact model definition is the refere
 | `attention-residuals-2603.15031.pdf` | Kimi Team, "Attention Residuals", arXiv 2603.15031 |
 | `universal-transformers-1807.03819.pdf` | Dehghani et al., arXiv 1807.03819 |
 
-llama.cpp's port lives in `~/sw/llama.cpp/src/models/inkling2.cpp` and `inkling2-loop.cpp` (not copied; pinned by commit in the bench results).
+llama.cpp's port lives in `src/models/inkling2.cpp` and `inkling2-loop.cpp` (not copied; pinned by commit in the bench results).

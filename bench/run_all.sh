@@ -7,7 +7,7 @@ repo=$(cd "$here/.." && pwd)
 R=$here/results
 mkdir -p "$R"
 M=${INKLING_MODEL:-$(ls "$HOME"/.cache/huggingface/hub/models--ggml-org--Inkling-2-Mini-GGUF/snapshots/*/Inkling-2-Mini-IQ4_NL.gguf)}
-LLAMA=${LLAMA:-$HOME/sw/llama.cpp}
+LLAMA=${LLAMA:-$repo/../llama.cpp}
 C=$(git -C "$LLAMA" rev-parse --short HEAD)
 OURS=$(git -C "$repo" rev-parse --short HEAD)
 INK=$repo/target/release/inkling

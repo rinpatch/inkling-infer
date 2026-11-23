@@ -2,7 +2,7 @@
 
 Sources, in priority order:
 - **T**: `transformers/inkling2_loop/modeling_inkling2_loop.py` (the official reference)
-- **L**: `~/sw/llama.cpp/src/models/inkling2.cpp` + `inkling2-loop.cpp`, plus `build_moe_ffn` in `src/llama-graph.cpp`
+- **L**: llama.cpp `src/models/inkling2.cpp` + `inkling2-loop.cpp`, plus `build_moe_ffn` in `src/llama-graph.cpp`
 - Background: `web/*.md` (blog, model card, Goodfire appendix with the loop equations), `attention-residuals-2603.15031.pdf`
 
 Where **T** and **L** differ in form but agree in math, the difference is listed in `NOTES.md`.

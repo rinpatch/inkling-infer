@@ -1,11 +1,11 @@
 # inkling-infer
 
 A Rust + Metal inference engine for Inkling 2 Mini (`inkling2_loop` GGUF), benchmarked against llama.cpp and the MLX engines.
-Plan: `~/.claude/plans/let-s-try-writing-a-functional-planet.md`. Model spec: `docs/reference/ARCHITECTURE.md` (read it before touching the forward pass); T vs L differences in `docs/reference/NOTES.md`.
+Model spec: `docs/reference/ARCHITECTURE.md` (read it before touching the forward pass); T vs L differences in `docs/reference/NOTES.md`.
 
 ## Paths
 - Model: `~/.cache/huggingface/hub/models--ggml-org--Inkling-2-Mini-GGUF/snapshots/*/Inkling-2-Mini-IQ4_NL.gguf`
-- llama.cpp (oracle + baseline): `~/sw/llama.cpp`, tools in `build/bin` (`llama-bench`, `llama-eval-callback`, `llama-perplexity`, `llama-tokenize`)
+- llama.cpp (oracle + baseline): a checkout next to this repo (`../llama.cpp`; scripts take `LLAMA`), tools in `build/bin` (`llama-bench`, `llama-eval-callback`, `llama-perplexity`, `llama-tokenize`)
 - Python helpers run with `uv run --with numpy python -I <script>`. No global pip installs.
 
 ## Rules
@@ -16,4 +16,4 @@ Plan: `~/.claude/plans/let-s-try-writing-a-functional-planet.md`. Model spec: `d
 - Commit at the end of each phase. The commit message explains the logic in detail: what the design is and why, the invariants, and how it was verified.
 
 ## Agent benchmark (SWE-bench)
-`bench/swe/README.md`: ours vs llama-server vs Ollama on 20 SWE-bench Verified tasks via mini-swe-agent (containers on `nanakusa`). One command, `bench/swe/night.sh`; run it only when the user asks.
+`bench/swe/README.md`: ours vs llama-server vs Ollama on 20 SWE-bench Verified tasks via mini-swe-agent. Host settings go in `bench/swe/local.env` (not in git). One command, `bench/swe/night.sh`; run it only when the user asks.

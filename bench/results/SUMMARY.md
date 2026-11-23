@@ -73,7 +73,7 @@ Decode +4-7% at empty context and +5-6% at 4K (64% / 54% of the roofline). The c
 
 ## vs llama.cpp master and the open Inkling performance PRs, 2026-11-23
 
-Same session, AC power, `llama-bench -ngl 99 -r 3` (`-d 4096` for decode at depth) on the same IQ4_NL GGUF; ours via `inkling bench`. Builds in worktrees under ~/sw/llama-prs, each at its PR head (19-27 commits behind master).
+Same session, AC power, `llama-bench -ngl 99 -r 3` (`-d 4096` for decode at depth) on the same IQ4_NL GGUF; ours via `inkling bench`. Builds in separate worktrees, each at its PR head (19-27 commits behind master).
 
 | engine | pp512 | pp4096 | tg128 | tg128 @ 4K |
 |---|---|---|---|---|
